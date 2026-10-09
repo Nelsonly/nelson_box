@@ -19,3 +19,9 @@ agent/downloads/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# 打包好的 App（内含访问令牌，不提交）
+dist/
+
+# Mac App 编译产物（含访问令牌）
+mac/build/

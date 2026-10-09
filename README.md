@@ -1,50 +1,71 @@
-# NelsonBox (全能跨端个人中枢工具箱) 🧰⚡
+# NelsonBox 📋
 
-> 适用于 **Windows / Linux / Android / macOS** 的个人多端实时通信与互动交互中枢。
-
----
-
-## 🌟 核心特性
-
-- 📋 **跨设备实时剪贴板同步**：手机、Mac、Windows 任何一端复制，其他所有在线设备毫秒级同步，支持历史记录与防回环机制。
-- 📁 **跨端极速文件中转**：支持拖拽上传、图片实时预览、手机拍照即传、电脑静默自动下载到本地。
-- 🤖 **手机远程调用 Mac / 小主机 AI 问询**：
-  - 手机发送 Prompt / 报错截图 -> 云端中枢调度 -> Mac / 家庭小主机 本地 AI (Ollama / Claude Code) 处理 -> 流式打字机效果回传手机。
-- 🖥️ **家庭算力小主机扩展准备**：无缝对接后续本地 24 小时微型主机（Ollama Qwen/DeepSeek 等本地大模型算力池）。
-- 📱 **Web PWA 零安装开箱即用**：响应式极简 UI，手机浏览器直接打开或“添加到主屏幕”即可当原生 App 使用。
-
----
-
-## 🏗️ 架构概览
+自建的跨设备剪贴板同步：手机、Mac、浏览器之间实时同步文字。
 
 ```text
- [ 📱 手机端 PWA / 客户端 ]
-         │
-         ▼ (WebSocket / HTTPS)
- ┌──────────────────────────────────────────────┐
- │   ☁️ 云端调度中枢 (VPS / 独立公网服务器)        │
- │   • FastAPI + WebSocket 实时消息总线         │
- │   • 文件临时中转 / 存储管理                    │
- │   • 多端在线状态感知与指令路由                 │
- └──────────────────────┬───────────────────────┘
-                        │ (长连接反向注册，无视家庭内网限制)
-        ┌───────────────┴───────────────┐
-        ▼                               ▼
- [ 💻 你的主力机 Mac / PC ]     [ 🖥️ 家庭小主机算力节点 ]
- • 桌面常驻守护 Agent           • 24小时常驻 AI 算力中心
- • 剪贴板自动同步               • Ollama (Qwen/DeepSeek)
- • 本地终端 / AI 任务调度       • 私有知识库与自动化流水线
+ [ Android App ]   [ 网页 / PWA ]   [ Mac 菜单栏 App ]   [ Python Agent (Linux/Windows) ]
+        └────────────────┴──────── WebSocket ─┴──────────────────┘
+                                    │
+                         ☁️ 中枢服务 (FastAPI)
+                         历史记录：最多 50 条 × 64KB，存在单个 JSON 文件
 ```
 
----
+## 目录
 
-## 🚀 模块结构
+| 目录 | 说明 |
+|---|---|
+| `server/` | 中枢服务（FastAPI + WebSocket）和网页端 |
+| `app/` | Android App（Flutter） |
+| `mac/` | Mac 菜单栏 App（Swift，无需 Xcode 工程） |
+| `agent/` | Python 版桌面 Agent，可用于 Linux / Windows |
 
-- `server/`: 运行在云端中枢（或小主机）的 Web 控制台与 WebSocket 服务。
-- `agent/`: 运行在 Mac / PC 上的本地轻量守护进程（剪贴板监听、本地 AI 调度、文件自动落盘）。
-- `docs/`: 详细设计与使用文档。
+## 服务端
 
----
+```bash
+pip install fastapi uvicorn websockets
+NELSON_BOX_TOKEN=$(openssl rand -hex 16) ./start_server.sh
+```
 
-## 📄 License
+- 所有接口都需要令牌：REST 用 `Authorization: Bearer <token>`，WebSocket 用 `?token=`
+- 数据保存在 `server/data/clipboard.json`，单条超过 64KB 会被拒绝
+- 不记录访问日志（日志级别为 warning），避免占用磁盘、泄露令牌
+
+生产环境用 systemd 运行，配置在 `/etc/systemd/system/nelson-box.service`，令牌在 `/etc/nelson_box.env`。
+
+更新服务器代码：
+
+```bash
+COPYFILE_DISABLE=1 tar czf - server/app.py server/config.py server/static | ssh root@<服务器> 'tar xzf - -C /opt/nelson_box && systemctl restart nelson-box'
+```
+
+## 客户端
+
+服务器地址和令牌在编译时注入，写在 `app/dart_defines.json`（已被 git 忽略）：
+
+```json
+{ "NB_SERVER": "http://<服务器>:18888", "NB_TOKEN": "<令牌>" }
+```
+
+**Android**
+
+```bash
+cd app && flutter build apk --release --split-per-abi --dart-define-from-file=dart_defines.json
+```
+
+支持：一键发送手机剪贴板、选中文字菜单 / 分享菜单直接发送、收到内容自动复制。
+
+**Mac**
+
+```bash
+./mac/build.sh   # 生成 mac/build/NelsonBox.app
+```
+
+菜单栏常驻，复制即同步；自动跳过密码管理器复制的密码。
+
+**网页**：浏览器打开服务器地址，输入令牌。
+
+**Python Agent**：`./start_agent.sh http://<服务器>:18888 <令牌>`
+
+## License
+
 MIT License © 2026 Nelson

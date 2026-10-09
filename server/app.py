@@ -1,348 +1,221 @@
-import os
+import hmac
 import json
+import os
 import time
 import uuid
-import shutil
-from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
-    UploadFile,
-    File,
-    Form,
-    HTTPException,
-    Depends,
-    Query,
-    Request,
-)
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 from .config import (
-    BASE_DIR,
-    UPLOAD_DIR,
     AUTH_TOKEN,
+    BASE_DIR,
+    CLIPBOARD_FILE,
     HOST,
-    PORT,
+    MAX_CLIPBOARD_BYTES,
     MAX_CLIPBOARD_HISTORY,
+    PORT,
 )
 
-app = FastAPI(title="NelsonBox Hub", version="1.0.0")
+app = FastAPI(title="NelsonBox Clipboard", version="2.0.0")
 
-# 挂载静态文件与模板
 STATIC_DIR = BASE_DIR / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
-# 状态存储（内存中，轻量快速）
-clipboard_history: List[dict] = []
-current_clipboard = {
-    "text": "欢迎使用 NelsonBox 多端中枢！",
-    "updated_at": time.time(),
-    "sender": "System",
-}
 
 
+def check_token(token: Optional[str]) -> bool:
+    return bool(token) and hmac.compare_digest(token, AUTH_TOKEN)
+
+
+# --- 剪贴板存储（内存 + 单个 JSON 文件持久化）---
+class ClipboardStore:
+    def __init__(self):
+        self.history: List[dict] = []
+        self._load()
+
+    def _load(self):
+        try:
+            self.history = json.loads(CLIPBOARD_FILE.read_text("utf-8"))[:MAX_CLIPBOARD_HISTORY]
+        except (FileNotFoundError, ValueError):
+            self.history = []
+
+    def _save(self):
+        # 先写临时文件再替换，避免写一半时断电导致文件损坏
+        tmp = CLIPBOARD_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.history, ensure_ascii=False), "utf-8")
+        os.replace(tmp, CLIPBOARD_FILE)
+
+    @property
+    def current(self) -> Optional[dict]:
+        return self.history[0] if self.history else None
+
+    def add(self, text: str, sender: str, sender_id: str) -> Optional[dict]:
+        """新增一条记录；与当前内容相同则返回 None（不重复存储）"""
+        if len(text.encode("utf-8")) > MAX_CLIPBOARD_BYTES:
+            raise ValueError(f"内容超过 {MAX_CLIPBOARD_BYTES // 1024}KB 上限")
+        if self.current and self.current["text"] == text:
+            return None
+        # 历史里已有相同内容则移到最前，不占两份空间
+        self.history = [h for h in self.history if h["text"] != text]
+        item = {
+            "id": uuid.uuid4().hex[:8],
+            "text": text,
+            "sender": sender,
+            "sender_id": sender_id,
+            "updated_at": time.time(),
+        }
+        self.history.insert(0, item)
+        del self.history[MAX_CLIPBOARD_HISTORY:]
+        self._save()
+        return item
+
+    def clear(self):
+        self.history = []
+        self._save()
+
+
+store = ClipboardStore()
+
+
+# --- 连接管理 ---
 class ConnectionManager:
     def __init__(self):
-        # device_id -> {"ws": WebSocket, "name": str, "type": str, "joined_at": float}
-        self.active_connections: Dict[str, dict] = {}
+        # device_id -> {"ws", "name", "type", "joined_at"}
+        self.active: Dict[str, dict] = {}
 
     async def connect(self, ws: WebSocket, device_id: str, name: str, dev_type: str):
         await ws.accept()
-        self.active_connections[device_id] = {
-            "ws": ws,
-            "name": name,
-            "type": dev_type,
-            "joined_at": time.time(),
-        }
-        await self.broadcast_device_list()
+        old = self.active.get(device_id)
+        if old:
+            # 同一设备重连：关闭旧连接
+            try:
+                await old["ws"].close()
+            except Exception:
+                pass
+        self.active[device_id] = {"ws": ws, "name": name, "type": dev_type, "joined_at": time.time()}
+        await self.broadcast_devices()
 
-    def disconnect(self, device_id: str):
-        if device_id in self.active_connections:
-            del self.active_connections[device_id]
+    async def disconnect(self, device_id: str, ws: WebSocket):
+        # 只移除属于这个 ws 的记录，避免把重连后的新连接删掉
+        info = self.active.get(device_id)
+        if info and info["ws"] is ws:
+            del self.active[device_id]
+            await self.broadcast_devices()
 
-    async def broadcast_device_list(self):
-        devices = [
-            {
-                "id": did,
-                "name": info["name"],
-                "type": info["type"],
-                "joined_at": info["joined_at"],
-            }
-            for did, info in self.active_connections.items()
+    def device_list(self) -> List[dict]:
+        return [
+            {"id": did, "name": i["name"], "type": i["type"], "joined_at": i["joined_at"]}
+            for did, i in self.active.items()
         ]
-        msg = json.dumps({"type": "devices:update", "devices": devices})
-        await self.broadcast(msg)
 
-    async def broadcast(self, message: str, exclude_device_id: Optional[str] = None):
-        dead_devices = []
-        for did, info in self.active_connections.items():
-            if did == exclude_device_id:
+    async def broadcast_devices(self):
+        await self.broadcast({"type": "devices:update", "devices": self.device_list()})
+
+    async def broadcast(self, msg: dict, exclude: Optional[str] = None):
+        text = json.dumps(msg, ensure_ascii=False)
+        for did, info in list(self.active.items()):
+            if did == exclude:
                 continue
             try:
-                await info["ws"].send_text(message)
+                await info["ws"].send_text(text)
             except Exception:
-                dead_devices.append(did)
-
-        for did in dead_devices:
-            self.disconnect(did)
-
-    async def send_to_device(self, target_id: str, message: str) -> bool:
-        if target_id in self.active_connections:
-            try:
-                await self.active_connections[target_id]["ws"].send_text(message)
-                return True
-            except Exception:
-                self.disconnect(target_id)
-        return False
+                self.active.pop(did, None)
 
 
 manager = ConnectionManager()
 
 
-def verify_token(token: Optional[str] = Query(None)):
-    if token != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid auth token")
-    return token
+async def publish(text: str, sender: str, sender_id: str) -> Optional[dict]:
+    item = store.add(text, sender, sender_id)
+    if item:
+        await manager.broadcast({"type": "clipboard:sync", "data": item}, exclude=sender_id)
+    return item
 
 
-# --- Web 页面 ---
-@app.get("/", response_class=HTMLResponse)
-async def serve_index(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-        context={"auth_token": AUTH_TOKEN},
-    )
+# --- 页面 ---
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
-# --- REST 接口 ---
+# --- REST 接口（需在请求头带 Authorization: Bearer <token>）---
+def require_auth(authorization: Optional[str]):
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not check_token(token):
+        raise HTTPException(status_code=401, detail="令牌无效")
+
+
 @app.get("/api/clipboard")
-async def get_clipboard():
-    return {
-        "current": current_clipboard,
-        "history": clipboard_history[:MAX_CLIPBOARD_HISTORY],
-    }
+async def get_clipboard(authorization: Optional[str] = Header(None)):
+    require_auth(authorization)
+    return {"current": store.current, "history": store.history}
 
 
 @app.post("/api/clipboard")
-async def post_clipboard(data: dict):
-    global current_clipboard
+async def post_clipboard(data: dict, authorization: Optional[str] = Header(None)):
+    require_auth(authorization)
     text = data.get("text", "")
-    sender = data.get("sender", "Web")
-    sender_id = data.get("sender_id", "")
-
-    if not text:
-        raise HTTPException(status_code=400, detail="Text cannot be empty")
-
-    item = {
-        "id": str(uuid.uuid4())[:8],
-        "text": text,
-        "sender": sender,
-        "sender_id": sender_id,
-        "updated_at": time.time(),
-    }
-    current_clipboard = item
-    clipboard_history.insert(0, item)
-    if len(clipboard_history) > MAX_CLIPBOARD_HISTORY:
-        clipboard_history.pop()
-
-    # 广播给除发送端外的所有设备
-    msg = json.dumps({"type": "clipboard:sync", "data": item})
-    await manager.broadcast(msg, exclude_device_id=sender_id)
-
-    return {"status": "ok", "item": item}
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="内容不能为空")
+    try:
+        item = await publish(text, data.get("sender", "API"), data.get("sender_id", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    return {"status": "ok", "item": item or store.current}
 
 
-@app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    sender: str = Form("Web"),
-    sender_id: str = Form(""),
-):
-    safe_filename = f"{int(time.time())}_{file.filename}"
-    file_path = UPLOAD_DIR / safe_filename
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    file_size = os.path.getsize(file_path)
-    file_info = {
-        "id": safe_filename,
-        "name": file.filename,
-        "size": file_size,
-        "sender": sender,
-        "sender_id": sender_id,
-        "uploaded_at": time.time(),
-        "url": f"/api/download/{safe_filename}",
-    }
-
-    # 广播新文件提醒
-    msg = json.dumps({"type": "file:new", "data": file_info})
-    await manager.broadcast(msg, exclude_device_id=sender_id)
-
-    return {"status": "ok", "file": file_info}
+@app.delete("/api/clipboard")
+async def clear_clipboard(authorization: Optional[str] = Header(None)):
+    require_auth(authorization)
+    store.clear()
+    await manager.broadcast({"type": "clipboard:history", "history": []})
+    return {"status": "ok"}
 
 
-@app.get("/api/files")
-async def list_files():
-    files = []
-    for p in sorted(UPLOAD_DIR.glob("*"), key=os.path.getmtime, reverse=True):
-        if p.is_file():
-            # 剥离前缀时间戳展示原名
-            raw_name = p.name
-            orig_name = raw_name.split("_", 1)[1] if "_" in raw_name else raw_name
-            files.append(
-                {
-                    "id": raw_name,
-                    "name": orig_name,
-                    "size": p.stat().st_size,
-                    "uploaded_at": p.stat().st_mtime,
-                    "url": f"/api/download/{raw_name}",
-                }
-            )
-    return {"files": files[:50]}
-
-
-@app.get("/api/download/{filename}")
-async def download_file(filename: str):
-    file_path = UPLOAD_DIR / filename
-    if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    orig_name = filename.split("_", 1)[1] if "_" in filename else filename
-    return FileResponse(
-        path=file_path,
-        filename=orig_name,
-        media_type="application/octet-stream",
-    )
-
-
-@app.get("/api/devices")
-async def list_devices():
-    return {
-        "devices": [
-            {
-                "id": did,
-                "name": info["name"],
-                "type": info["type"],
-                "joined_at": info["joined_at"],
-            }
-            for did, info in manager.active_connections.items()
-        ]
-    }
-
-
-# --- WebSocket 实时总线 ---
+# --- WebSocket 实时同步 ---
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
     device_id: str = Query(...),
     name: str = Query("Unknown"),
-    device_type: str = Query("web"),  # web | mac | windows | linux | android
+    device_type: str = Query("web"),
     token: str = Query(""),
 ):
-    global current_clipboard
-
-    if token != AUTH_TOKEN:
+    if not check_token(token):
+        # 先 accept 再关闭，客户端才能收到 4001 并提示“令牌错误”，而不是无限重连
+        await websocket.accept()
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
     await manager.connect(websocket, device_id, name, device_type)
-
     try:
-        # 连接成功后先推当前剪贴板
         await websocket.send_text(
-            json.dumps({"type": "clipboard:sync", "data": current_clipboard})
+            json.dumps({"type": "clipboard:history", "history": store.history}, ensure_ascii=False)
         )
-
         while True:
-            raw_data = await websocket.receive_text()
-            data = json.loads(raw_data)
-            action = data.get("type")
-
-            if action == "clipboard:send":
+            try:
+                data = json.loads(await websocket.receive_text())
+            except ValueError:
+                continue
+            if data.get("type") == "clipboard:send":
                 text = data.get("text", "")
-                if text:
-                    item = {
-                        "id": str(uuid.uuid4())[:8],
-                        "text": text,
-                        "sender": name,
-                        "sender_id": device_id,
-                        "updated_at": time.time(),
-                    }
-                    current_clipboard = item
-                    clipboard_history.insert(0, item)
-                    if len(clipboard_history) > MAX_CLIPBOARD_HISTORY:
-                        clipboard_history.pop()
-
-                    # 广播给其他设备
-                    sync_msg = json.dumps({"type": "clipboard:sync", "data": item})
-                    await manager.broadcast(sync_msg, exclude_device_id=device_id)
-
-            elif action == "ai:chat_request":
-                # 手机端向指定设备（如 Mac / 小主机）发起 AI 问答
-                target_device_id = data.get("target_device_id")
-                req_id = data.get("request_id") or str(uuid.uuid4())[:8]
-                payload = {
-                    "type": "ai:execute",
-                    "request_id": req_id,
-                    "requester_id": device_id,
-                    "prompt": data.get("prompt", ""),
-                    "model": data.get("model", "auto"),
-                }
-                # 如果没有指定 target_device_id，自动找一个在线的 mac 或 server
-                if not target_device_id:
-                    for did, dinfo in manager.active_connections.items():
-                        if dinfo["type"] in ("mac", "server", "windows", "linux"):
-                            target_device_id = did
-                            break
-
-                if target_device_id:
-                    sent = await manager.send_to_device(
-                        target_device_id, json.dumps(payload)
-                    )
-                    if not sent:
-                        await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "ai:error",
-                                    "request_id": req_id,
-                                    "error": "目标设备已离线",
-                                }
-                            )
-                        )
-                else:
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                try:
+                    await publish(text, name, device_id)
+                except ValueError as e:
                     await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "ai:error",
-                                "request_id": req_id,
-                                "error": "当前没有在线的算力节点 (Mac 或小主机未连接)",
-                            }
-                        )
+                        json.dumps({"type": "clipboard:error", "error": str(e)}, ensure_ascii=False)
                     )
-
-            elif action in ("ai:stream_chunk", "ai:done", "ai:error"):
-                # 算力节点（Mac / 小主机）流式回传数据给最初的发起者手机
-                requester_id = data.get("requester_id")
-                if requester_id:
-                    await manager.send_to_device(requester_id, raw_data)
-
     except WebSocketDisconnect:
-        manager.disconnect(device_id)
-        await manager.broadcast_device_list()
-    except Exception:
-        manager.disconnect(device_id)
-        await manager.broadcast_device_list()
+        pass
+    finally:
+        await manager.disconnect(device_id, websocket)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server.app:app", host=HOST, port=PORT, reload=True)
+    uvicorn.run("server.app:app", host=HOST, port=PORT)
