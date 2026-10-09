@@ -82,7 +82,8 @@ class AiHost {
   final String name;
   final List<AiEngine> engines;
   final List<String> projects;
-  const AiHost(this.id, this.name, this.engines, this.projects);
+  final bool editEnabled; // Mac 上设置了编辑口令，允许“可修改”模式
+  const AiHost(this.id, this.name, this.engines, this.projects, {this.editEnabled = false});
 
   factory AiHost.fromJson(Map j) => AiHost(
         _str(j['id']),
@@ -95,6 +96,7 @@ class AiHost {
           for (final p in _list(j['projects']))
             if (p is Map && _str(p['name']).isNotEmpty) _str(p['name']),
         ],
+        editEnabled: j['edit_enabled'] == true,
       );
 }
 
@@ -127,9 +129,11 @@ class AiMessage {
   final double createdAt;
   final String model; // 这条回复实际使用的模型（可能为空）
   final String effort;
+  final String mode; // 用户消息：ask / edit
+  final String modeUsed; // 回复：实际使用的模式（ask / edit，可能为空）
 
   AiMessage(this.id, this.role, this.text, this.status, this.error, this.sender, this.createdAt,
-      {this.model = '', this.effort = ''});
+      {this.model = '', this.effort = '', this.mode = '', this.modeUsed = ''});
 
   factory AiMessage.fromJson(Map j) => AiMessage(
         _str(j['id']),
@@ -141,6 +145,8 @@ class AiMessage {
         _num(j['created_at']),
         model: _str(j['model']),
         effort: _str(j['effort']),
+        mode: _str(j['mode']),
+        modeUsed: _str(j['mode_used']),
       );
 
   bool get isUser => role == 'user';
@@ -205,13 +211,18 @@ class AiChat {
   }
 
   /// 回复下方显示的“模型 · 强度”，例如 “GPT-6-Sol · high”；都为空时返回空字符串
-  String usedLabel(String engineId, AiMessage m) {
+  /// [showMode] 为 true 时追加“可修改 / 只读”（桌面端，和网页一致）
+  String usedLabel(String engineId, AiMessage m, {bool showMode = false}) {
     var name = m.model;
     if (name.isNotEmpty) {
       name = engine(engineId)?.model(name)?.name ?? _anyModelName(name) ?? name;
     }
-    return [name, m.effort].where((s) => s.isNotEmpty).join(' · ');
+    final mode = !showMode || m.modeUsed.isEmpty ? '' : (m.modeUsed == 'edit' ? '可修改' : '只读');
+    return [name, m.effort, mode].where((s) => s.isNotEmpty).join(' · ');
   }
+
+  /// 有主机允许“可修改”模式
+  bool get editEnabled => hosts.any((h) => h.editEnabled);
 
   String? _anyModelName(String id) {
     for (final h in hosts) {
@@ -223,7 +234,9 @@ class AiChat {
     return null;
   }
 
-  /// 组装 ai:send 消息。手机端固定只读问答；model / effort 为“默认”时不发送
+  /// 组装 ai:send 消息；model / effort 为“默认”时不发送。
+  /// 只有 [allowEdit]（桌面端）且选了 [edit] 并填了口令时才是“可修改”模式，
+  /// 其余情况（包括 Android）固定只读问答，且不带口令。
   static Map<String, dynamic> sendPayload({
     String? convId,
     required String engine,
@@ -231,18 +244,24 @@ class AiChat {
     required String text,
     required String req,
     ModelChoice choice = const ModelChoice(),
-  }) =>
-      {
-        'type': 'ai:send',
-        'conv_id': ?convId,
-        'engine': engine,
-        'project': project,
-        'text': text,
-        'mode': 'ask',
-        if (choice.model.isNotEmpty) 'model': choice.model,
-        if (choice.effort.isNotEmpty) 'effort': choice.effort,
-        'client_req': req,
-      };
+    bool allowEdit = false,
+    bool edit = false,
+    String passcode = '',
+  }) {
+    final isEdit = allowEdit && edit && passcode.isNotEmpty;
+    return {
+      'type': 'ai:send',
+      'conv_id': ?convId,
+      'engine': engine,
+      'project': project,
+      'text': text,
+      'mode': isEdit ? 'edit' : 'ask',
+      if (isEdit) 'passcode': passcode,
+      if (choice.model.isNotEmpty) 'model': choice.model,
+      if (choice.effort.isNotEmpty) 'effort': choice.effort,
+      'client_req': req,
+    };
+  }
 
   String engineName(String id) {
     for (final h in hosts) {

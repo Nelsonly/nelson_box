@@ -14,6 +14,7 @@ import android.os.Looper
 import android.os.Parcelable
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.View
 import android.webkit.MimeTypeMap
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -64,6 +65,13 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+    }
+
+    // desktop_drop 插件只给 Windows 端用来拖放文件；它的 Android 部分会给内容视图挂拖放监听，
+    // 这里移除，保持 Android 上的行为不变
+    override fun onStart() {
+        super.onStart()
+        findViewById<View>(android.R.id.content)?.setOnDragListener(null)
     }
 
     // App 已在运行时，再次从“分享”或文字选择菜单进入

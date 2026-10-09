@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'ai_page.dart';
 import 'hub.dart';
 import 'p2p.dart';
+import 'platform.dart';
 import 'update_dialog.dart';
 import 'update_service.dart';
 
@@ -63,9 +65,10 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  static const _share = MethodChannel('nelsonbox/share');
+  final _native = NativeBridge.instance;
   final _input = TextEditingController();
-  late final P2P p2p = P2P(widget.hub, _share);
+  late final P2P p2p = P2P(widget.hub, _native);
+  bool _dragging = false; // 桌面端：文件正拖到窗口上
   int _page = 0;
   bool _checkedUpdate = false;
   String? _targetId; // 文件发送目标设备
@@ -84,24 +87,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     hub.onAiError = _toast;
     p2p.onIncoming = (t) => _toast('正在接收来自【${t.peerName}】的文件…');
     p2p.onSaved = (t, f) => _toast(
-          '已保存到 下载/NelsonBox：${f.name}',
+          '已保存到 $_saveDirLabel：${f.name}',
           action: SnackBarAction(label: '打开', onPressed: () => _open(f)),
         );
     p2p.onFailed = (t) {
       if (t.error != '已取消') _toast('${t.dir == TransferDir.send ? '发送' : '接收'}失败：${t.error}');
     };
 
-    // 从“分享”菜单或文字选择菜单进入
-    _share.setMethodCallHandler((call) async {
-      switch (call.method) {
-        case 'sharedText':
-          _sendShared(call.arguments as String?);
-        case 'sharedFiles':
-          _sendSharedFiles((call.arguments as List?)?.cast<String>());
-      }
-    });
-    _share.invokeMethod<String>('takeSharedText').then(_sendShared);
-    _share.invokeListMethod<String>('takeSharedFiles').then(_sendSharedFiles);
+    // 从“分享”菜单或文字选择菜单进入（只有 Android 有）
+    if (AppPlatform.isAndroid) {
+      _native.listenShares(onText: _sendShared, onFiles: _sendSharedFiles);
+      _native.takeSharedText().then(_sendShared);
+      _native.takeSharedFiles().then(_sendSharedFiles);
+    }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!hub.configured) _openSettings();
@@ -176,6 +174,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (err != null) _toast(err);
   }
 
+  /// 收到的文件保存位置（显示用）
+  String get _saveDirLabel => AppPlatform.isAndroid ? '下载/NelsonBox' : r'下载\NelsonBox';
+
+  /// 桌面端：把文件拖到“文件传输”页上发送（不删除原文件）
+  Future<void> _sendDropped(List<String> paths) async {
+    final files = <LocalFile>[];
+    for (final p in paths) {
+      if (await FileSystemEntity.type(p) != FileSystemEntityType.file) {
+        _toast('只能发送文件，不能发送文件夹');
+        continue;
+      }
+      files.add(LocalFile(p, File(p).uri.pathSegments.last));
+    }
+    if (files.isEmpty) return;
+    final others = hub.otherDevices;
+    if (others.isEmpty) {
+      _toast(hub.status == HubStatus.online ? '没有其他在线设备，无法发送文件' : '未连接服务器，无法发送文件');
+      return;
+    }
+    final target = _target ?? await _chooseDevice(others);
+    if (target == null) return;
+    final err = await p2p.sendFiles(target, files);
+    if (err != null) _toast(err);
+  }
+
   Future<Device?> _chooseDevice(List<Device> devices) async {
     if (!mounted) return null;
     return showModalBottomSheet<Device>(
@@ -218,13 +241,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       files.add(LocalFile(path, f.name));
     }
     if (files.isEmpty) return;
-    // file_picker 会把文件复制到缓存目录，传完删掉副本
-    final err = await p2p.sendFiles(target, files, deleteAfter: true);
+    // Android 上 file_picker 会把文件复制到缓存目录，传完删掉副本；
+    // 桌面端拿到的是原文件路径，绝不能删除
+    final err = await p2p.sendFiles(target, files, deleteAfter: AppPlatform.isAndroid);
     if (err != null) _toast(err);
   }
 
   Future<void> _open(SavedFile f) async {
     final err = await p2p.open(f);
+    if (err != null) _toast(err);
+  }
+
+  Future<void> _reveal(SavedFile f) async {
+    final err = await p2p.reveal(f);
     if (err != null) _toast(err);
   }
 
@@ -249,11 +278,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _sendPhoneClipboard() async {
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text ?? '';
+    final noun = AppPlatform.deviceNoun;
     if (text.isEmpty) {
-      _toast('手机剪贴板是空的');
+      _toast('$noun剪贴板是空的');
       return;
     }
-    _toast(hub.send(text) ?? '已发送手机剪贴板');
+    _toast(hub.send(text) ?? '已发送$noun剪贴板');
   }
 
   void _sendInput() {
@@ -296,7 +326,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _checkedUpdate = true;
     try {
       final info = await UpdateService.packageInfo();
-      final release = await UpdateService.latest();
+      final release = await UpdateService.latest(windows: !AppPlatform.isAndroid);
       if (!mounted || release == null) return;
       final build = int.tryParse(info.buildNumber) ?? 0;
       if (UpdateService.isNewer(info.version, build, release.tag)) {
@@ -377,7 +407,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           FilledButton.icon(
             onPressed: _sendPhoneClipboard,
             icon: const Icon(Icons.upload),
-            label: const Text('发送手机剪贴板'),
+            label: Text('发送${AppPlatform.deviceNoun}剪贴板'),
             style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
           ),
           const SizedBox(height: 12),
@@ -423,6 +453,41 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _filesTab() {
+    final list = _filesList();
+    if (!AppPlatform.isDesktop) return list;
+    final scheme = Theme.of(context).colorScheme;
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _dragging = true),
+      onDragExited: (_) => setState(() => _dragging = false),
+      onDragDone: (detail) {
+        setState(() => _dragging = false);
+        _sendDropped([for (final f in detail.files) f.path]);
+      },
+      child: Stack(children: [
+        list,
+        if (_dragging)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Container(
+                margin: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: scheme.primaryContainer.withValues(alpha: 0.85),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: scheme.primary, width: 2),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  _target == null ? '松开发送（之后选择设备）' : '松开发送到 ${_target!.name}',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  Widget _filesList() {
     final others = hub.otherDevices;
     final target = _target;
     final finished = p2p.transfers.any((t) => !t.active);
@@ -459,7 +524,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         const SizedBox(height: 6),
         Text(
-          '设备之间直连传输，不经过服务器；传输时请保持 App 在前台。收到的文件保存在 下载/NelsonBox',
+          AppPlatform.isAndroid
+              ? '设备之间直连传输，不经过服务器；传输时请保持 App 在前台。收到的文件保存在 下载/NelsonBox'
+              : '设备之间直连传输，不经过服务器；也可以把文件拖到这里发送。收到的文件保存在 $_saveDirLabel',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 16),
@@ -516,8 +583,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
           if (t.active)
             IconButton(tooltip: '取消', icon: const Icon(Icons.close), onPressed: () => p2p.cancel(t))
-          else if (!send && t.saved.isNotEmpty)
+          else if (!send && t.saved.isNotEmpty) ...[
+            if (p2p.canReveal && t.saved.length == 1)
+              IconButton(
+                tooltip: '在文件夹中显示',
+                icon: const Icon(Icons.folder_open_outlined),
+                onPressed: () => _reveal(t.saved.first),
+              ),
             TextButton(onPressed: () => _openSaved(t), child: const Text('打开')),
+          ],
         ]),
       ),
     );
@@ -720,7 +794,7 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 8),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('收到内容自动复制到手机剪贴板'),
+            title: Text('收到内容自动复制到${AppPlatform.deviceNoun}剪贴板'),
             value: _autoCopy,
             onChanged: (v) => setState(() => _autoCopy = v),
           ),
