@@ -249,7 +249,7 @@ const AI = (() => {
   }
 
   function engineName(id) {
-    return { claude: "Claude Code", codex: "Codex", gemini: "Gemini" }[id] || id;
+    return { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity" }[id] || id;
   }
 
   function renderMessages() {

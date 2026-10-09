@@ -61,6 +61,7 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var pingTimer: Timer?
     private var reconnectTimer: Timer?
+    private var lastActivity = Date() // 最近一次收到消息或心跳回应的时间
 
     var otherDevices: [Device] { devices.filter { $0.id != settings.deviceId } }
 
@@ -112,13 +113,15 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
         t.receive { [weak self] result in
             DispatchQueue.main.async {
                 guard let self, t === self.task else { return }
+                self.lastActivity = Date()
                 switch result {
                 case .success(.string(let s)):
                     self.handle(s)
                     self.receive(t)
                 case .success:
                     self.receive(t)
-                case .failure:
+                case .failure(let error):
+                    NSLog("NelsonBox: 连接断开 code=%d %@", t.closeCode.rawValue, error.localizedDescription)
                     self.closed(t, code: t.closeCode.rawValue)
                 }
             }
@@ -142,10 +145,28 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         guard webSocketTask === task else { return }
         status = .online
+        lastActivity = Date()
         ai.onConnected()
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak webSocketTask] _ in
-            webSocketTask?.sendPing { _ in }
+        // 心跳看门狗：心跳失败或太久没有任何回应，就当连接已死，立即重连
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self, weak webSocketTask] _ in
+            guard let self, let t = webSocketTask, t === self.task else { return }
+            if Date().timeIntervalSince(self.lastActivity) > 50 {
+                return self.forceReconnect(t, reason: "50 秒没有回应")
+            }
+            t.sendPing { error in
+                DispatchQueue.main.async {
+                    if let error { self.forceReconnect(t, reason: "心跳失败：\(error.localizedDescription)") }
+                    else if t === self.task { self.lastActivity = Date() }
+                }
+            }
         }
+    }
+
+    private func forceReconnect(_ t: URLSessionWebSocketTask, reason: String) {
+        guard t === task else { return }
+        NSLog("NelsonBox: %@，重新连接", reason)
+        t.cancel(with: .goingAway, reason: nil)
+        closed(t, code: 0)
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,

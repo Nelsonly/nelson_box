@@ -1,6 +1,6 @@
 # AI 聊天协议
 
-手机 / Windows 网页通过服务器，和 Mac 上的 AI 命令行工具（Claude Code / Codex / Gemini）对话。
+手机 / Windows 网页通过服务器，和 Mac 上的 AI 命令行工具（Claude Code / Codex / Antigravity）对话。
 
 ```text
 客户端 ──ai:send──▶ 服务器（保存对话）──ai:run──▶ Mac（AI 主机，调用命令行）
@@ -31,7 +31,7 @@ Android App 只用 `ask` 模式，不提供口令输入。
 | `ai:cancel` | `msg_id` | 取消正在生成的回复 |
 | `ai:delete` | `conv_id` | 删除对话 |
 
-`engine`：`claude` / `codex` / `gemini`。`project`：Mac 上配置的项目名，空字符串表示不选项目（Mac 在 `~/NelsonBox-AI` 里回答）。
+`engine`：`claude` / `codex` / `antigravity`。`project`：Mac 上配置的项目名，空字符串表示不选项目（Mac 在 `~/NelsonBox-AI` 里回答）。
 
 ## 服务器 → 客户端
 

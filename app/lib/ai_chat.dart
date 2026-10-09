@@ -253,7 +253,7 @@ class AiChat {
     return switch (id) {
       'claude' => 'Claude Code',
       'codex' => 'Codex',
-      'gemini' => 'Gemini',
+      'antigravity' => 'Antigravity',
       _ => id,
     };
   }

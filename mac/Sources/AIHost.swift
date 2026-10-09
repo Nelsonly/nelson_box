@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-// Mac 作为 AI 主机：收到服务器转来的提问，在本机调用 claude / codex / gemini 命令行，
+// Mac 作为 AI 主机：收到服务器转来的提问，在本机调用 claude / codex / agy（Antigravity CLI）命令行，
 // 把输出流式发回服务器。服务器只转发和保存文字，AI 都在本机运行，用的是本机登录的账号。
 //
 // 权限：
@@ -30,16 +30,19 @@ struct EngineModels {
 }
 
 enum AIEngine: String, CaseIterable, Identifiable {
-    case claude, codex, gemini
+    case claude, codex, antigravity
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .claude: "Claude Code"
         case .codex: "Codex"
-        case .gemini: "Gemini"
+        case .antigravity: "Antigravity"
         }
     }
+
+    /// 命令行程序名
+    var command: String { self == .antigravity ? "agy" : rawValue }
 
     /// 命令行可执行文件的常见位置（GUI 程序拿不到终端的 PATH，所以先查这些）
     var candidates: [String] {
@@ -47,7 +50,7 @@ enum AIEngine: String, CaseIterable, Identifiable {
         switch self {
         case .claude: return ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "\(home)/.claude/local/claude"]
         case .codex: return ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"]
-        case .gemini: return ["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini", "\(home)/.local/bin/gemini"]
+        case .antigravity: return ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
         }
     }
 }
@@ -105,13 +108,13 @@ final class AIHost: ObservableObject {
         projects.append(AIProject(name: name, path: url.path))
     }
 
-    /// 在登录 shell 里找命令行工具的位置，并记下完整 PATH（gemini 等依赖 node）
+    /// 在登录 shell 里找命令行工具的位置，并记下完整 PATH（有些工具依赖 node）
     func detectEngines() {
         DispatchQueue.global().async {
             let path = Self.shell("echo $PATH").trimmingCharacters(in: .whitespacesAndNewlines)
             var found: [AIEngine: String] = [:]
             for e in AIEngine.allCases {
-                let fromShell = Self.shell("command -v \(e.rawValue)").trimmingCharacters(in: .whitespacesAndNewlines)
+                let fromShell = Self.shell("command -v \(e.command)").trimmingCharacters(in: .whitespacesAndNewlines)
                 let list = (fromShell.hasPrefix("/") ? [fromShell] : []) + e.candidates
                 if let p = list.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) { found[e] = p }
             }
@@ -151,10 +154,36 @@ final class AIHost: ObservableObject {
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 em.defaultModel = obj["model"] as? String
             }
-        case .gemini:
-            em.models = [("pro", "Gemini Pro", []), ("flash", "Gemini Flash", []), ("flash-lite", "Gemini Flash-Lite", [])]
+        case .antigravity:
+            // agy models 每行 “slug<TAB>显示名”，模型名里已经带了推理强度（如 gemini-3.8-flash-high）
+            let exe = ["\(home.path)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
+                .first { FileManager.default.isExecutableFile(atPath: $0) }
+            if let exe {
+                for line in run(exe, ["models"]).split(separator: "\n") {
+                    let cols = line.split(separator: "\t", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                    if cols.count == 2, !cols[0].contains(" ") { em.models.append((cols[0], cols[1], [])) }
+                }
+            }
         }
         return em
+    }
+
+    /// 直接运行一个程序并取输出（最多等 30 秒）
+    private static func run(_ exe: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return "" }
+        let timer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: timer)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        timer.cancel()
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// 只取 TOML 顶层（第一个 [section] 之前）的 key = "value"
@@ -310,11 +339,12 @@ final class AIHost: ObservableObject {
             a += edit ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "read-only"]
             if let session { a += ["resume", session] }
             return a + [prompt]
-        case .gemini:
-            var a = ["-p", prompt, "--output-format", "stream-json"]
-            if let model { a += ["-m", model] }
-            if let session { a += ["--resume", session] }
-            a += ["--approval-mode", edit ? "yolo" : "default"]
+        case .antigravity:
+            // 默认模式下未授权的操作（写文件、运行命令）会被自动拒绝，正好用作只读问答
+            var a = ["-p", prompt, "--output-format", "stream-json", "--print-timeout", "30m"]
+            if let model { a += ["--model", model] }
+            if let session { a += ["--conversation", session] }
+            if edit { a += ["--dangerously-skip-permissions"] }
             return a
         }
     }
@@ -434,7 +464,7 @@ final class AIRun {
         switch engine {
         case .claude: parseClaude(o)
         case .codex: parseCodex(o)
-        case .gemini: parseGemini(o)
+        case .antigravity: parseAntigravity(o)
         }
     }
 
@@ -503,20 +533,40 @@ final class AIRun {
         }
     }
 
-    private func parseGemini(_ o: [String: Any]) {
-        if let sid = o["session_id"] as? String { session = sid }
-        switch o["type"] as? String {
-        case "message":
-            if o["role"] as? String == "assistant", let t = o["content"] as? String { emit(t) }
-        case "tool_use":
-            emit("\n\n" + toolLine(o["tool_name"] as? String ?? "工具", o["parameters"]))
-        case "result":
-            emit("\n\n")
-            if o["status"] as? String == "error" {
-                resultError = ((o["error"] as? [String: Any])?["message"] as? String) ?? "Gemini 出错"
+    /// Antigravity CLI 的 stream-json：init → step_update（工具调用 / 回复增量）→ result
+    private func parseAntigravity(_ o: [String: Any]) {
+        if let cid = o["conversation_id"] as? String { session = cid }
+        switch o["event"] as? String {
+        case "step_update":
+            let su = o["step_update"] as? [String: Any] ?? [:]
+            let state = su["state"] as? String
+            switch su["step_type"] as? String {
+            case "agent_response":
+                if let t = su["text_delta"] as? String { emit(t) }
+                if state == "DONE", !text.isEmpty, !text.hasSuffix("\n\n") { emit(text.hasSuffix("\n") ? "\n" : "\n\n") }
+            case "tool":
+                if state == "ACTIVE" {
+                    let info = su["tool_info"] as? [String: Any] ?? [:]
+                    let name = su["tool_name"] as? String ?? "工具"
+                    var line = toolLine(name, info["parameters"])
+                    // 只读模式下，修改文件、执行命令这类操作会被 Antigravity 自动拒绝，标出来以免误以为已经改了
+                    if !edit, name.range(of: "write|replace|edit|delete|move|run_command|command", options: .regularExpression) != nil {
+                        line = line.replacingOccurrences(of: "\n\n", with: "（只读模式，已拒绝）\n\n")
+                    }
+                    emit(line)
+                }
+            default:
+                break
             }
-        case "error":
-            if let m = o["message"] as? String { emit("> ⚠️ \(m)\n\n") }
+        case "result":
+            let r = o["result"] as? [String: Any] ?? [:]
+            if let cid = r["conversation_id"] as? String { session = cid }
+            if let status = r["status"] as? String, status != "SUCCESS" {
+                let err = r["error"] as? String ?? (r["error"] as? [String: Any])?["message"] as? String
+                resultError = err ?? "Antigravity 出错（\(status)）"
+            } else if text.isEmpty, let resp = r["response"] as? String {
+                emit(resp)
+            }
         default:
             break
         }
@@ -524,7 +574,8 @@ final class AIRun {
 
     private func toolLine(_ name: String, _ input: Any?) -> String {
         let inp = input as? [String: Any] ?? [:]
-        let detail = (inp["command"] ?? inp["file_path"] ?? inp["path"] ?? inp["pattern"] ?? inp["url"]) as? String
+        let keys = ["command", "CommandLine", "file_path", "AbsolutePath", "TargetFile", "path", "pattern", "Query", "url", "Url"]
+        let detail = keys.lazy.compactMap { inp[$0] as? String }.first
         return "> 🔧 \(name)\(detail.map { "：`\(oneLine($0))`" } ?? "")\n\n"
     }
 
@@ -546,7 +597,8 @@ private func constantTimeEqual(_ a: String, _ b: String) -> Bool {
 
 /// 编辑口令存在钥匙串里
 enum Keychain {
-    private static let service = "com.nelsonbox.mac"
+    // 正式 App 用自己的 bundle id；命令行测试程序没有 bundle id，用单独的条目，避免覆盖正式口令
+    private static let service = Bundle.main.bundleIdentifier ?? "com.nelsonbox.mac.dev"
 
     static func get(_ key: String) -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,

@@ -31,7 +31,7 @@ void main() {
           'engines': [
             {'id': 'claude', 'name': 'Claude Code', 'available': true},
             {'id': 'codex', 'name': 'Codex', 'available': true},
-            {'id': 'gemini', 'name': 'Gemini', 'available': false},
+            {'id': 'antigravity', 'name': 'Antigravity', 'available': false},
           ],
           'projects': [
             {'name': 'nelson_box'},
@@ -44,7 +44,7 @@ void main() {
     expect(ai.hostOnline, isTrue);
     expect(ai.engines.map((e) => e.id), ['claude', 'codex']);
     expect(ai.projects, ['nelson_box', 'game']);
-    expect(ai.engineName('gemini'), 'Gemini');
+    expect(ai.engineName('antigravity'), 'Antigravity');
     ai.apply({'type': 'ai:hosts', 'hosts': []});
     expect(ai.hostOnline, isFalse);
     expect(ai.engines, isEmpty);
