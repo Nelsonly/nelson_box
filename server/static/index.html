@@ -28,6 +28,7 @@
       <nav class="tabs">
         <button class="tab active" data-tab="clip">剪贴板</button>
         <button class="tab" data-tab="files">文件</button>
+        <button class="tab" data-tab="ai">AI</button>
       </nav>
 
       <div id="tab-clip">
@@ -74,12 +75,49 @@
         </section>
       </div>
 
+      <div id="tab-ai" hidden>
+        <div id="ai-layout" class="ai-layout">
+          <aside class="card ai-side">
+            <div class="row">
+              <h2>对话</h2>
+              <button id="ai-new" class="link">＋ 新对话</button>
+            </div>
+            <ul id="ai-conv-list"></ul>
+          </aside>
+          <section class="card ai-main">
+            <div class="row ai-head">
+              <button id="ai-toggle-list" class="link">☰</button>
+              <strong id="ai-title" class="ai-title">新对话</strong>
+              <span id="ai-host" class="pill">…</span>
+            </div>
+            <div class="ai-options">
+              <select id="ai-engine" title="AI 工具"></select>
+              <select id="ai-project" title="项目"></select>
+              <select id="ai-model" title="模型"></select>
+              <select id="ai-effort" title="推理强度"></select>
+              <select id="ai-mode" title="权限">
+                <option value="ask">只读问答</option>
+                <option value="edit">可修改</option>
+              </select>
+              <input id="ai-passcode" type="password" placeholder="编辑口令" autocomplete="off" hidden />
+            </div>
+            <div id="ai-mode-hint" class="muted"></div>
+            <div id="ai-messages" class="ai-messages"></div>
+            <div class="ai-input-row">
+              <textarea id="ai-input" rows="2"></textarea>
+              <button id="ai-send" class="primary">发送</button>
+            </div>
+          </section>
+        </div>
+      </div>
+
       <p class="muted center"><button id="logout" class="link">退出登录</button></p>
     </div>
   </main>
 
   <div id="toast"></div>
   <script src="/static/p2p.js"></script>
+  <script src="/static/ai.js"></script>
   <script src="/static/clip.js"></script>
 </body>
 </html>

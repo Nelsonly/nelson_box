@@ -17,6 +17,7 @@ struct NelsonBoxApp: App {
             ContentView()
                 .environmentObject(hub)
                 .environmentObject(hub.p2p)
+                .environmentObject(hub.ai)
                 .environmentObject(settings)
                 .frame(minWidth: 520, minHeight: 480)
                 .onAppear { if hub.status == .connecting { hub.connect() } }
@@ -43,15 +44,20 @@ struct ContentView: View {
             Picker("", selection: $tab) {
                 Text("剪贴板").tag(0)
                 Text("文件").tag(1)
+                Text("AI 主机").tag(2)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 220)
+            .frame(width: 300)
             .padding(.vertical, 10)
 
             Divider()
 
-            if tab == 0 { ClipboardView() } else { FilesView() }
+            switch tab {
+            case 0: ClipboardView()
+            case 1: FilesView()
+            default: AIHostView()
+            }
         }
         .toolbar {
             ToolbarItem(placement: .automatic) { StatusView() }
@@ -326,6 +332,100 @@ struct TransferRow: View {
         case .failed: parts.append("失败：\(t.error)")
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - AI 主机
+
+struct AIHostView: View {
+    @EnvironmentObject var ai: AIHost
+    @State private var passcode = ""
+    @State private var showPasscode = false
+
+    var body: some View {
+        Form {
+            Section {
+                ForEach(AIEngine.allCases) { e in
+                    HStack {
+                        Image(systemName: ai.enginePaths[e] != nil ? "checkmark.circle.fill" : "xmark.circle")
+                            .foregroundStyle(ai.enginePaths[e] != nil ? .green : .secondary)
+                        Text(e.title)
+                        Spacer()
+                        Text(ai.enginePaths[e] ?? "未安装").font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.head)
+                    }
+                }
+                Button("重新检测") { ai.detectEngines() }
+            } header: {
+                Text("AI 工具")
+            } footer: {
+                Text("在 Mac 上用你已登录的命令行工具回答其他设备的提问。NelsonBox 需要保持打开。")
+            }
+
+            Section {
+                if ai.projects.isEmpty {
+                    Text("还没有项目。没有选项目时，AI 在 ~/NelsonBox-AI 目录里回答问题。").foregroundStyle(.secondary)
+                }
+                ForEach(ai.projects) { p in
+                    HStack {
+                        Image(systemName: "folder")
+                        VStack(alignment: .leading) {
+                            Text(p.name)
+                            Text(p.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
+                        Spacer()
+                        Button { ai.projects.removeAll { $0 == p } } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                Button("添加项目目录…") { pickFolder() }
+            } header: {
+                Text("项目")
+            } footer: {
+                Text("提问时可以选择项目，AI 会在该目录里工作。")
+            }
+
+            Section {
+                HStack {
+                    Group {
+                        if showPasscode { TextField("编辑口令", text: $passcode) } else { SecureField("编辑口令", text: $passcode) }
+                    }
+                    Button { showPasscode.toggle() } label: { Image(systemName: showPasscode ? "eye.slash" : "eye") }
+                        .buttonStyle(.borderless)
+                    Button("保存") {
+                        ai.setPasscode(passcode.trimmingCharacters(in: .whitespaces))
+                        passcode = ""
+                    }
+                    .disabled(passcode.trimmingCharacters(in: .whitespaces).count < 6)
+                    if ai.hasPasscode {
+                        Button("清除", role: .destructive) { ai.setPasscode("") }
+                    }
+                }
+                Label(ai.hasPasscode ? "已设置：输入了正确口令的设备可以让 AI 修改文件、运行命令"
+                                     : "未设置：所有设备都只能只读问答",
+                      systemImage: ai.hasPasscode ? "lock.open" : "lock")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: {
+                Text("编辑口令（至少 6 位）")
+            } footer: {
+                Text("口令保存在本机钥匙串，只由这台 Mac 核对，服务器不保存。手机不输入口令，就只能问答。")
+            }
+
+            Section("最近任务") {
+                if ai.activity.isEmpty { Text("暂无").foregroundStyle(.secondary) }
+                ForEach(ai.activity, id: \.self) { Text($0).font(.callout) }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func pickFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "添加"
+        if panel.runModal() == .OK, let url = panel.url { ai.addProject(url) }
     }
 }
 

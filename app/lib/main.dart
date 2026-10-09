@@ -5,8 +5,11 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'ai_page.dart';
 import 'hub.dart';
 import 'p2p.dart';
+import 'update_dialog.dart';
+import 'update_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,12 +24,31 @@ class NelsonBoxApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Color(0xFF3B82F6);
+    const seed = Color(0xFF1769E0);
+    ThemeData makeTheme(Brightness brightness) {
+      final scheme = ColorScheme.fromSeed(seedColor: seed, brightness: brightness);
+      return ThemeData(
+        colorScheme: scheme,
+        useMaterial3: true,
+        brightness: brightness,
+        scaffoldBackgroundColor: scheme.surfaceContainerLowest,
+        cardTheme: CardThemeData(
+          elevation: 0,
+          color: scheme.surfaceContainerLow,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: scheme.surfaceContainerLow,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+        ),
+      );
+    }
     return MaterialApp(
       title: 'NelsonBox',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      theme: makeTheme(Brightness.light),
+      darkTheme: makeTheme(Brightness.dark),
       home: HomePage(hub: hub),
     );
   }
@@ -40,11 +62,12 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _share = MethodChannel('nelsonbox/share');
   final _input = TextEditingController();
-  late final _tabs = TabController(length: 2, vsync: this);
   late final P2P p2p = P2P(widget.hub, _share);
+  int _page = 0;
+  bool _checkedUpdate = false;
   String? _targetId; // 文件发送目标设备
 
   Hub get hub => widget.hub;
@@ -58,6 +81,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       _toast(hub.autoCopy ? '已复制来自【${item.sender}】的内容' : '收到来自【${item.sender}】的内容');
     };
     hub.onError = _toast;
+    hub.onAiError = _toast;
     p2p.onIncoming = (t) => _toast('正在接收来自【${t.peerName}】的文件…');
     p2p.onSaved = (t, f) => _toast(
           '已保存到 下载/NelsonBox：${f.name}',
@@ -81,6 +105,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!hub.configured) _openSettings();
+      if (hub.autoCheckUpdates) _checkUpdate(silent: true);
     });
   }
 
@@ -88,7 +113,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _input.dispose();
-    _tabs.dispose();
     p2p.dispose();
     super.dispose();
   }
@@ -134,7 +158,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       }
     }
 
-    if (mounted) _tabs.animateTo(1);
+    if (mounted) setState(() => _page = 1);
     await _waitOnline();
     final others = hub.otherDevices;
     if (others.isEmpty) {
@@ -261,29 +285,84 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     await Navigator.of(context).push(MaterialPageRoute(builder: (_) => SettingsPage(hub: hub)));
   }
 
+  void _selectPage(int index) {
+    if (_page != index) setState(() => _page = index);
+    if (index == 2) hub.aiList();
+    Navigator.of(context).maybePop();
+  }
+
+  Future<void> _checkUpdate({bool silent = false}) async {
+    if (_checkedUpdate && silent) return;
+    _checkedUpdate = true;
+    try {
+      final info = await UpdateService.packageInfo();
+      final release = await UpdateService.latest();
+      if (!mounted || release == null) return;
+      final build = int.tryParse(info.buildNumber) ?? 0;
+      if (UpdateService.isNewer(info.version, build, release.tag)) {
+        await UpdateDialog.show(context, release, 'v${info.version}+$build');
+      } else if (!silent) {
+        _toast('当前已是最新版本 v${info.version}');
+      }
+    } catch (e) {
+      if (!silent) _toast('检查更新失败：$e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    const titles = ['剪贴板', '文件传输', 'AI 助手'];
     return ListenableBuilder(
       listenable: Listenable.merge([hub, p2p]),
       builder: (context, _) => Scaffold(
         appBar: AppBar(
-          title: const Text('NelsonBox'),
+          title: Text(titles[_page]),
           actions: [
             _StatusChip(hub: hub),
-            IconButton(icon: const Icon(Icons.settings_outlined), onPressed: _openSettings),
+            const SizedBox(width: 8),
           ],
-          bottom: TabBar(
-            controller: _tabs,
-            tabs: [
-              const Tab(text: '剪贴板'),
-              Tab(text: switch (p2p.transfers.where((t) => t.active).length) {
-                0 => '文件',
-                final n => '文件 ($n)',
-              }),
-            ],
-          ),
         ),
-        body: TabBarView(controller: _tabs, children: [_clipboardTab(), _filesTab()]),
+        drawer: NavigationDrawer(
+          selectedIndex: _page,
+          onDestinationSelected: _selectPage,
+          header: _DrawerHeader(hub: hub),
+          children: [
+            const NavigationDrawerDestination(
+              icon: Icon(Icons.content_paste_outlined),
+              selectedIcon: Icon(Icons.content_paste_rounded),
+              label: Text('剪贴板'),
+            ),
+            NavigationDrawerDestination(
+              icon: Badge(
+                isLabelVisible: p2p.transfers.any((t) => t.active),
+                label: Text('${p2p.transfers.where((t) => t.active).length}'),
+                child: const Icon(Icons.swap_horiz_rounded),
+              ),
+              selectedIcon: const Icon(Icons.folder_copy_rounded),
+              label: const Text('文件传输'),
+            ),
+            const NavigationDrawerDestination(
+              icon: Icon(Icons.auto_awesome_outlined),
+              selectedIcon: Icon(Icons.auto_awesome_rounded),
+              label: Text('AI 助手'),
+            ),
+            const Padding(padding: EdgeInsets.symmetric(horizontal: 16), child: Divider()),
+            ListTile(leading: const Icon(Icons.settings_outlined), title: const Text('设置'), onTap: _openSettings),
+            ListTile(
+              leading: const Icon(Icons.system_update_outlined),
+              title: const Text('检查更新'),
+              onTap: () {
+                Navigator.pop(context);
+                _checkUpdate();
+              },
+            ),
+          ],
+        ),
+        body: IndexedStack(index: _page, children: [
+          _clipboardTab(),
+          _filesTab(),
+          AiTab(hub: hub, toast: _toast),
+        ]),
       ),
     );
   }
@@ -473,6 +552,39 @@ String _formatTime(double ts) {
   return '${d.month}/${d.day} $hm';
 }
 
+class _DrawerHeader extends StatelessWidget {
+  final Hub hub;
+  const _DrawerHeader({required this.hub});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 16),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: [scheme.primaryContainer, scheme.tertiaryContainer]),
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: Row(children: [
+        Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(color: scheme.primary, borderRadius: BorderRadius.circular(14)),
+          child: Icon(Icons.inventory_2_rounded, color: scheme.onPrimary),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('NelsonBox', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700)),
+            Text(hub.deviceName, maxLines: 1, overflow: TextOverflow.ellipsis),
+          ]),
+        ),
+      ]),
+    );
+  }
+}
+
 class _StatusChip extends StatelessWidget {
   final Hub hub;
   const _StatusChip({required this.hub});
@@ -546,6 +658,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final _token = TextEditingController(text: widget.hub.token);
   late final _name = TextEditingController(text: widget.hub.deviceName);
   late bool _autoCopy = widget.hub.autoCopy;
+  late bool _autoCheckUpdates = widget.hub.autoCheckUpdates;
   bool _showToken = false;
 
   @override
@@ -562,6 +675,7 @@ class _SettingsPageState extends State<SettingsPage> {
       token: _token.text,
       deviceName: _name.text,
       autoCopy: _autoCopy,
+      autoCheckUpdates: _autoCheckUpdates,
     );
     if (mounted) Navigator.of(context).pop();
   }
@@ -609,6 +723,14 @@ class _SettingsPageState extends State<SettingsPage> {
             title: const Text('收到内容自动复制到手机剪贴板'),
             value: _autoCopy,
             onChanged: (v) => setState(() => _autoCopy = v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            secondary: const Icon(Icons.system_update_outlined),
+            title: const Text('启动时自动检查更新'),
+            subtitle: const Text('只有发现新版本时才提示'),
+            value: _autoCheckUpdates,
+            onChanged: (v) => setState(() => _autoCheckUpdates = v),
           ),
         ],
       ),

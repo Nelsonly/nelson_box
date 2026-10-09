@@ -1,0 +1,139 @@
+name: Release Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v1.1.0+2'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BUILD_NAME="${VERSION%%+*}"
+          if [[ "$VERSION" == *+* ]]; then
+            BUILD_NUMBER="${VERSION##*+}"
+          else
+            BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          fi
+          if ! [[ "$BUILD_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Tag must look like v1.2.3 or v1.2.3+4" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "build_name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Verify signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          [ -n "$KEYSTORE_BASE64" ] || { echo 'Missing GitHub secret: ANDROID_KEYSTORE_BASE64' >&2; exit 1; }
+          [ -n "$KEY_ALIAS" ] || { echo 'Missing GitHub secret: ANDROID_KEY_ALIAS' >&2; exit 1; }
+          [ -n "$KEY_PASSWORD" ] || { echo 'Missing GitHub secret: ANDROID_KEY_PASSWORD' >&2; exit 1; }
+          [ -n "$STORE_PASSWORD" ] || { echo 'Missing GitHub secret: ANDROID_STORE_PASSWORD' >&2; exit 1; }
+
+      - name: Restore release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/release.jks
+          cat > android/key.properties <<EOF
+          storeFile=release.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+      - name: Build signed APK
+        env:
+          NB_SERVER: ${{ secrets.NB_SERVER }}
+          NB_TOKEN: ${{ secrets.NB_TOKEN }}
+        run: |
+          flutter build apk --release \
+            --build-name='${{ steps.version.outputs.build_name }}' \
+            --build-number='${{ steps.version.outputs.build_number }}' \
+            --dart-define=NB_SERVER="$NB_SERVER" \
+            --dart-define=NB_TOKEN="$NB_TOKEN"
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "../NelsonBox-Android-${{ steps.version.outputs.tag }}.apk"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NelsonBox-Android-${{ steps.version.outputs.tag }}
+          path: NelsonBox-Android-${{ steps.version.outputs.tag }}.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release and upload APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          FLAGS=(--title "NelsonBox $TAG" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "NelsonBox-Android-$TAG.apk" --clobber
+          else
+            gh release create "$TAG" "NelsonBox-Android-$TAG.apk" "${FLAGS[@]}"
+          fi

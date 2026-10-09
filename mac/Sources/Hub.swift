@@ -51,6 +51,7 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
 
     let settings: AppSettings
     let p2p = P2PManager()
+    let ai = AIHost()
     @Published private(set) var status: Status = .connecting
     @Published private(set) var history: [ClipItem] = []
     @Published private(set) var devices: [Device] = []
@@ -71,6 +72,9 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
             self?.sendJSON(["type": "rtc:signal", "to": to, "data": data])
         }
         p2p.onNotice = { [weak self] in self?.message = $0 }
+        ai.send = { [weak self] in self?.sendJSON($0) }
+        ai.isOnline = { [weak self] in self?.status == .online }
+        ai.hostName = { [weak self] in self?.settings.deviceName ?? "Mac" }
     }
 
     // MARK: 连接
@@ -138,6 +142,7 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         guard webSocketTask === task else { return }
         status = .online
+        ai.onConnected()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak webSocketTask] _ in
             webSocketTask?.sendPing { _ in }
         }
@@ -176,6 +181,8 @@ final class Hub: NSObject, ObservableObject, URLSessionWebSocketDelegate {
             if let from = obj["from"] as? String, let d = obj["data"] as? [String: Any] {
                 p2p.handleSignal(from: from, fromName: obj["from_name"] as? String ?? "其他设备", data: d)
             }
+        case "ai:run", "ai:cancel":
+            ai.handle(obj)
         case "rtc:error":
             p2p.handleError(transferId: obj["transfer_id"] as? String, error: obj["error"] as? String ?? "发送失败")
         default:

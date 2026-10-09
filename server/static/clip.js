@@ -32,7 +32,10 @@ function connect() {
   const qs = new URLSearchParams({ device_id: deviceId, name: deviceName, device_type: "web", token });
   ws = new WebSocket(`${proto}//${location.host}/ws?${qs}`);
 
-  ws.onopen = () => showApp();
+  ws.onopen = () => {
+    showApp();
+    AI.onConnected();
+  };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type === "clipboard:history") {
@@ -48,6 +51,8 @@ function connect() {
       renderTargets();
     } else if (msg.type === "clipboard:error") {
       toast(msg.error);
+    } else if (msg.type.startsWith("ai:")) {
+      AI.handle(msg);
     } else if (msg.type === "rtc:config") {
       P2P.setIceServers(msg.ice_servers);
     } else if (msg.type === "rtc:signal") {
@@ -328,6 +333,8 @@ function showTab(name) {
   }
   $("tab-clip").hidden = name !== "clip";
   $("tab-files").hidden = name !== "files";
+  $("tab-ai").hidden = name !== "ai";
+  document.body.classList.toggle("wide", name === "ai");
   storage.set("nelson_tab", name);
 }
 
@@ -393,6 +400,11 @@ dz.ondrop = (e) => {
   dz.classList.remove("over");
   sendFilesTo(e.dataTransfer.files);
 };
+AI.init((payload) => {
+  if (ws?.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(payload));
+  return true;
+});
 showTab(storage.get("nelson_tab") || "clip");
 renderTargets();
 renderTransfers();

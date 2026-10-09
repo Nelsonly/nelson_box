@@ -27,3 +27,8 @@ dist/
 mac/build/
 mac/.build/
 mac/Sources/Generated/
+
+# Android 发布签名（GitHub Actions 从 Secrets 注入）
+app/android/key.properties
+app/android/*.jks
+app/android/*.keystore

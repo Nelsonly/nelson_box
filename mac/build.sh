@@ -24,9 +24,10 @@ swift build -c release
 BIN=$(swift build -c release --show-bin-path)
 APP=build/NelsonBox.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 cp "$BIN/NelsonBox" "$APP/Contents/MacOS/NelsonBox"
 cp -R "$BIN/WebRTC.framework" "$APP/Contents/Frameworks/"
 cp Info.plist "$APP/Contents/Info.plist"
+cp Resources/NelsonBox.icns "$APP/Contents/Resources/NelsonBox.icns"
 codesign --force --deep --sign - "$APP"
 echo "✓ 已生成 $APP ($(du -sh "$APP" | cut -f1))"

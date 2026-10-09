@@ -10,6 +10,8 @@
 	<string>com.nelsonbox.mac</string>
 	<key>CFBundleExecutable</key>
 	<string>NelsonBox</string>
+	<key>CFBundleIconFile</key>
+	<string>NelsonBox</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

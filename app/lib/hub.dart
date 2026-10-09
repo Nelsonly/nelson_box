@@ -8,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'ai_chat.dart';
+
 const maxClipboardBytes = 64 * 1024; // 与服务端上限一致
 const maxHistory = 50;
 
@@ -62,6 +64,7 @@ class Hub extends ChangeNotifier {
   String deviceName = 'Android 手机';
   String deviceId = '';
   bool autoCopy = true;
+  bool autoCheckUpdates = true;
 
   HubStatus status = HubStatus.connecting;
   List<ClipItem> history = [];
@@ -69,6 +72,16 @@ class Hub extends ChangeNotifier {
 
   /// 收到其他设备内容时的回调（用于界面提示）
   void Function(ClipItem item)? onReceived;
+
+  /// AI 聊天状态（对话列表、当前对话、Mac 主机信息）
+  final AiChat ai = AiChat();
+
+  /// AI 标签页上次选的引擎和项目（新对话用）
+  String aiEngine = '';
+  String aiProject = '';
+
+  /// AI 请求被拒时的回调（用于界面提示）
+  void Function(String message)? onAiError;
 
   /// 服务器下发的 ICE 配置（只有 STUN，没有 TURN）
   List<Map<String, dynamic>> iceServers = [];
@@ -88,6 +101,9 @@ class Hub extends ChangeNotifier {
     token = _prefs.getString('token') ?? _defaultToken;
     deviceName = _prefs.getString('deviceName') ?? deviceName;
     autoCopy = _prefs.getBool('autoCopy') ?? true;
+    autoCheckUpdates = _prefs.getBool('autoCheckUpdates') ?? true;
+    aiEngine = _prefs.getString('aiEngine') ?? '';
+    aiProject = _prefs.getString('aiProject') ?? '';
     deviceId = _prefs.getString('deviceId') ?? '';
     if (deviceId.isEmpty) {
       final r = Random.secure();
@@ -104,15 +120,18 @@ class Hub extends ChangeNotifier {
     required String token,
     required String deviceName,
     required bool autoCopy,
+    required bool autoCheckUpdates,
   }) async {
     this.server = server.trim().replaceAll(RegExp(r'/+$'), '');
     this.token = token.trim();
     this.deviceName = deviceName.trim().isEmpty ? 'Android 手机' : deviceName.trim();
     this.autoCopy = autoCopy;
+    this.autoCheckUpdates = autoCheckUpdates;
     await _prefs.setString('server', this.server);
     await _prefs.setString('token', this.token);
     await _prefs.setString('deviceName', this.deviceName);
     await _prefs.setBool('autoCopy', autoCopy);
+    await _prefs.setBool('autoCheckUpdates', autoCheckUpdates);
     connect();
   }
 
@@ -149,6 +168,7 @@ class Hub extends ChangeNotifier {
       if (_ch != ch) return;
       _setStatus(HubStatus.online);
       _flushOutbox();
+      _aiResync();
     }).catchError((_) {});
 
     _sub = ch.stream.listen(
@@ -201,6 +221,10 @@ class Hub extends ChangeNotifier {
         notifyListeners();
       case 'clipboard:error':
         onError?.call(msg['error'] as String? ?? '发送失败');
+      case 'ai:hosts' || 'ai:convs' || 'ai:conv' || 'ai:delta' || 'ai:msg' || 'ai:error':
+        final err = ai.apply(msg);
+        notifyListeners();
+        if (err != null) onAiError?.call(err);
       case 'rtc:config':
         iceServers = ((msg['ice_servers'] as List?) ?? [])
             .whereType<Map>()
@@ -244,6 +268,92 @@ class Hub extends ChangeNotifier {
   void _addToHistory(ClipItem item) {
     history = [item, ...history.where((h) => h.text != item.text)].take(maxHistory).toList();
     notifyListeners();
+  }
+
+  // ---------- AI 聊天 ----------
+  bool _sendJson(Map<String, dynamic> msg) {
+    final ch = _ch;
+    if (status != HubStatus.online || ch == null) return false;
+    ch.sink.add(jsonEncode(msg));
+    return true;
+  }
+
+  /// 连上（含断线重连）后：刷新列表，并重新拉取当前对话，补齐掉线期间的回复
+  void _aiResync() {
+    // 掉线前发出、没收到确认的请求作废（服务器若已收到，会出现在对话列表里）
+    ai.pendingReq = null;
+    aiList();
+    final cur = ai.current;
+    if (cur != null) aiOpen(cur.id);
+  }
+
+  void setAiPrefs({String? engine, String? project}) {
+    if (engine != null) {
+      aiEngine = engine;
+      _prefs.setString('aiEngine', engine);
+    }
+    if (project != null) {
+      aiProject = project;
+      _prefs.setString('aiProject', project);
+    }
+    notifyListeners();
+  }
+
+  /// 某个引擎记住的模型 / 推理强度（已按主机当前的模型列表校正，不存在就回到默认）
+  ModelChoice aiChoice(String engine) => ModelChoice.resolve(
+        ai.engine(engine),
+        _prefs.getString('aiModel_$engine') ?? '',
+        _prefs.getString('aiEffort_$engine') ?? '',
+      );
+
+  void setAiChoice(String engine, ModelChoice c) {
+    _prefs.setString('aiModel_$engine', c.model);
+    _prefs.setString('aiEffort_$engine', c.effort);
+    notifyListeners();
+  }
+
+  void aiList() => _sendJson({'type': 'ai:list'});
+
+  void aiOpen(String convId) {
+    ai.openingId = convId;
+    if (!_sendJson({'type': 'ai:open', 'conv_id': convId})) ai.openingId = null;
+    notifyListeners();
+  }
+
+  /// 回到“新对话”状态（下一次发送会新建对话）
+  void aiNew() {
+    ai.current = null;
+    ai.openingId = null;
+    notifyListeners();
+  }
+
+  /// 发消息（手机端只用只读问答模式）。返回 null 表示已发出，否则返回错误信息
+  String? aiSend(String text,
+      {required String engine, required String project, ModelChoice choice = const ModelChoice()}) {
+    if (text.trim().isEmpty) return '内容为空';
+    if (ai.busy) return '上一条回复还没结束';
+    final cur = ai.current;
+    final req = AiChat.newReq();
+    final ok = _sendJson(AiChat.sendPayload(
+      convId: cur?.id,
+      engine: cur?.engine ?? engine,
+      project: cur?.project ?? project,
+      text: text,
+      req: req,
+      choice: choice,
+    ));
+    if (!ok) return '未连接服务器';
+    ai.pendingReq = req;
+    notifyListeners();
+    return null;
+  }
+
+  void aiCancel(String msgId) => _sendJson({'type': 'ai:cancel', 'msg_id': msgId});
+
+  bool aiDelete(String convId) {
+    if (!_sendJson({'type': 'ai:delete', 'conv_id': convId})) return false;
+    if (ai.current?.id == convId) aiNew();
+    return true;
   }
 
   // ---------- P2P 信令 ----------

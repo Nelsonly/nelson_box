@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -27,13 +28,17 @@ from .config import (
     TURN_SECRET,
     TURN_TTL_SECONDS,
 )
+from .ai import AIBroker
 from .stun import start_stun_server
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     transports = await start_stun_server(STUN_PORT) if STUN_PORT else []
+    ai_task = asyncio.create_task(ai.maintenance_loop())
     yield
+    ai_task.cancel()
+    ai.store.save()
     for t in transports:
         t.close()
 
@@ -156,6 +161,9 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+ai = AIBroker(send_to=manager.send_to, broadcast=manager.broadcast)
+AI_HOST_TYPES = {"ai:host", "ai:delta", "ai:snapshot", "ai:done"}
+AI_CLIENT_TYPES = {"ai:list", "ai:open", "ai:send", "ai:cancel", "ai:delete"}
 
 
 async def publish(text: str, sender: str, sender_id: str) -> Optional[dict]:
@@ -230,7 +238,7 @@ async def clear_clipboard(authorization: Optional[str] = Header(None)):
     return {"status": "ok"}
 
 
-# --- WebSocket：剪贴板同步 + P2P 信令 ---
+# --- WebSocket：剪贴板同步 + P2P 信令 + AI 聊天转发 ---
 MAX_SIGNAL_BYTES = 64 * 1024  # SDP / ICE 都很小，限制大小防止被拿来传数据
 @app.websocket("/ws")
 async def websocket_endpoint(
@@ -271,6 +279,16 @@ async def websocket_endpoint(
                         json.dumps({"type": "clipboard:error", "error": str(e)}, ensure_ascii=False)
                     )
 
+            # AI CLI 只在 Mac App 上运行；避免网页或手机误注册成主机。
+            elif mtype in AI_HOST_TYPES and device_type == "mac":
+                await ai.handle_host(device_id, data)
+
+            elif mtype in AI_CLIENT_TYPES:
+                async def reply(msg: dict):
+                    await websocket.send_text(json.dumps(msg, ensure_ascii=False))
+                data["device_type"] = device_type
+                await ai.handle_client(device_id, name, data, reply)
+
             elif mtype == "rtc:signal":
                 # 只转发，不解析、不保存
                 target = data.get("to")
@@ -290,6 +308,8 @@ async def websocket_endpoint(
     except WebSocketDisconnect:
         pass
     finally:
+        if manager.active.get(device_id, {}).get("ws") is websocket:
+            await ai.host_offline(device_id)
         await manager.disconnect(device_id, websocket)
 
 
