@@ -1,8 +1,11 @@
+import base64
+import hashlib
 import hmac
 import json
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -13,13 +16,29 @@ from .config import (
     AUTH_TOKEN,
     BASE_DIR,
     CLIPBOARD_FILE,
+    EXTRA_STUN_SERVERS,
     HOST,
     MAX_CLIPBOARD_BYTES,
     MAX_CLIPBOARD_HISTORY,
     PORT,
+    STUN_HOST,
+    STUN_PORT,
+    TURN_PORT,
+    TURN_SECRET,
+    TURN_TTL_SECONDS,
 )
+from .stun import start_stun_server
 
-app = FastAPI(title="NelsonBox Clipboard", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    transports = await start_stun_server(STUN_PORT) if STUN_PORT else []
+    yield
+    for t in transports:
+        t.close()
+
+
+app = FastAPI(title="NelsonBox", version="3.0.0", lifespan=lifespan)
 
 STATIC_DIR = BASE_DIR / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -79,6 +98,7 @@ class ClipboardStore:
 store = ClipboardStore()
 
 
+
 # --- 连接管理 ---
 class ConnectionManager:
     def __init__(self):
@@ -123,6 +143,17 @@ class ConnectionManager:
             except Exception:
                 self.active.pop(did, None)
 
+    async def send_to(self, device_id: str, msg: dict) -> bool:
+        info = self.active.get(device_id)
+        if not info:
+            return False
+        try:
+            await info["ws"].send_text(json.dumps(msg, ensure_ascii=False))
+            return True
+        except Exception:
+            self.active.pop(device_id, None)
+            return False
+
 
 manager = ConnectionManager()
 
@@ -132,6 +163,31 @@ async def publish(text: str, sender: str, sender_id: str) -> Optional[dict]:
     if item:
         await manager.broadcast({"type": "clipboard:sync", "data": item}, exclude=sender_id)
     return item
+
+
+def ice_servers(ws: WebSocket, device_id: str) -> List[dict]:
+    """主机名默认用客户端连进来时使用的地址。
+
+    配了 TURN_SECRET 时附带 TURN：按 coturn 的 use-auth-secret 规则生成 24 小时有效的临时账号，
+    WebRTC 会优先直连，只有直连失败才走服务器转发（数据端到端加密，服务器不存储）。
+    """
+    host = STUN_HOST or ws.headers.get("host", "").rsplit(":", 1)[0]
+    servers = []
+    if host and TURN_SECRET:
+        username = f"{int(time.time()) + TURN_TTL_SECONDS}:{device_id}"
+        credential = base64.b64encode(
+            hmac.new(TURN_SECRET.encode(), username.encode(), hashlib.sha1).digest()
+        ).decode()
+        servers.append({"urls": [f"stun:{host}:{TURN_PORT}"]})
+        servers.append({
+            "urls": [f"turn:{host}:{TURN_PORT}?transport=udp", f"turn:{host}:{TURN_PORT}?transport=tcp"],
+            "username": username,
+            "credential": credential,
+        })
+    elif host and STUN_PORT:
+        servers.append({"urls": [f"stun:{host}:{STUN_PORT}"]})
+    servers += [{"urls": [u]} for u in EXTRA_STUN_SERVERS]
+    return servers
 
 
 # --- 页面 ---
@@ -174,7 +230,8 @@ async def clear_clipboard(authorization: Optional[str] = Header(None)):
     return {"status": "ok"}
 
 
-# --- WebSocket 实时同步 ---
+# --- WebSocket：剪贴板同步 + P2P 信令 ---
+MAX_SIGNAL_BYTES = 64 * 1024  # SDP / ICE 都很小，限制大小防止被拿来传数据
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -194,12 +251,16 @@ async def websocket_endpoint(
         await websocket.send_text(
             json.dumps({"type": "clipboard:history", "history": store.history}, ensure_ascii=False)
         )
+        await websocket.send_text(json.dumps({"type": "rtc:config", "ice_servers": ice_servers(websocket, device_id)}))
         while True:
+            raw = await websocket.receive_text()
             try:
-                data = json.loads(await websocket.receive_text())
+                data = json.loads(raw)
             except ValueError:
                 continue
-            if data.get("type") == "clipboard:send":
+            mtype = data.get("type")
+
+            if mtype == "clipboard:send":
                 text = data.get("text", "")
                 if not isinstance(text, str) or not text.strip():
                     continue
@@ -209,6 +270,23 @@ async def websocket_endpoint(
                     await websocket.send_text(
                         json.dumps({"type": "clipboard:error", "error": str(e)}, ensure_ascii=False)
                     )
+
+            elif mtype == "rtc:signal":
+                # 只转发，不解析、不保存
+                target = data.get("to")
+                payload = data.get("data")
+                if not isinstance(target, str) or not isinstance(payload, dict) or len(raw) > MAX_SIGNAL_BYTES:
+                    continue
+                sent = await manager.send_to(
+                    target, {"type": "rtc:signal", "from": device_id, "from_name": name, "data": payload}
+                )
+                if not sent:
+                    await websocket.send_text(json.dumps({
+                        "type": "rtc:error",
+                        "to": target,
+                        "transfer_id": payload.get("transfer_id"),
+                        "error": "对方不在线",
+                    }, ensure_ascii=False))
     except WebSocketDisconnect:
         pass
     finally:

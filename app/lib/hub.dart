@@ -31,6 +31,21 @@ class ClipItem {
       );
 }
 
+/// 文件大小转成易读格式：512 B / 1.5 KB / 23.4 MB / 1.25 GB / 2 GB
+String formatBytes(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var v = bytes / 1024;
+  var i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  final digits = v >= 100 ? 0 : (i >= 2 ? 2 : 1);
+  final n = v.toStringAsFixed(digits).replaceFirst(RegExp(r'\.0+$'), '');
+  return '$n ${units[i]}';
+}
+
 class Device {
   final String id;
   final String name;
@@ -54,6 +69,13 @@ class Hub extends ChangeNotifier {
 
   /// 收到其他设备内容时的回调（用于界面提示）
   void Function(ClipItem item)? onReceived;
+
+  /// 服务器下发的 ICE 配置（只有 STUN，没有 TURN）
+  List<Map<String, dynamic>> iceServers = [];
+
+  /// 收到 P2P 信令 / 信令错误时的回调（由 P2P 模块设置）
+  void Function(String from, String fromName, Map<String, dynamic> data)? onSignal;
+  void Function(String? transferId, String error)? onSignalError;
 
   WebSocketChannel? _ch;
   StreamSubscription? _sub;
@@ -179,6 +201,19 @@ class Hub extends ChangeNotifier {
         notifyListeners();
       case 'clipboard:error':
         onError?.call(msg['error'] as String? ?? '发送失败');
+      case 'rtc:config':
+        iceServers = ((msg['ice_servers'] as List?) ?? [])
+            .whereType<Map>()
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList();
+      case 'rtc:signal':
+        final data = msg['data'];
+        final from = msg['from'];
+        if (data is Map && from is String) {
+          onSignal?.call(from, msg['from_name'] as String? ?? from, Map<String, dynamic>.from(data));
+        }
+      case 'rtc:error':
+        onSignalError?.call(msg['transfer_id'] as String?, msg['error'] as String? ?? '对方不在线');
     }
   }
 
@@ -210,6 +245,18 @@ class Hub extends ChangeNotifier {
     history = [item, ...history.where((h) => h.text != item.text)].take(maxHistory).toList();
     notifyListeners();
   }
+
+  // ---------- P2P 信令 ----------
+  /// 通过服务器转发信令；未连接时返回 false
+  bool sendSignal(String to, Map<String, dynamic> data) {
+    final ch = _ch;
+    if (status != HubStatus.online || ch == null) return false;
+    ch.sink.add(jsonEncode({'type': 'rtc:signal', 'to': to, 'data': data}));
+    return true;
+  }
+
+  /// 其他在线设备（不含本机）
+  List<Device> get otherDevices => devices.where((d) => d.id != deviceId).toList();
 
   void _setStatus(HubStatus s) {
     status = s;

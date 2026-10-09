@@ -25,6 +25,12 @@
     </section>
 
     <div id="app" hidden>
+      <nav class="tabs">
+        <button class="tab active" data-tab="clip">剪贴板</button>
+        <button class="tab" data-tab="files">文件</button>
+      </nav>
+
+      <div id="tab-clip">
       <!-- 发送 -->
       <section class="card">
         <textarea id="input" rows="4" placeholder="粘贴或输入内容，发送到所有设备"></textarea>
@@ -48,12 +54,32 @@
         </div>
         <ul id="history"></ul>
       </section>
+      </div>
+
+      <div id="tab-files" hidden>
+        <section class="card">
+          <div class="row target-row">
+            <span>发送到</span>
+            <select id="target"></select>
+          </div>
+          <label id="dropzone" class="dropzone">
+            <input id="file-input" type="file" multiple hidden />
+            <span>点击选择文件，或把文件拖到这里</span>
+            <span class="muted">设备之间直接传输，不经过服务器；对方需要在线</span>
+          </label>
+        </section>
+        <section class="card">
+          <h2>传输记录</h2>
+          <ul id="transfers"></ul>
+        </section>
+      </div>
 
       <p class="muted center"><button id="logout" class="link">退出登录</button></p>
     </div>
   </main>
 
   <div id="toast"></div>
+  <script src="/static/p2p.js"></script>
   <script src="/static/clip.js"></script>
 </body>
 </html>

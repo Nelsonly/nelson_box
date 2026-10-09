@@ -1,0 +1,22 @@
+[Unit]
+Description=NelsonBox clipboard hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nelsonbox
+Group=nelsonbox
+WorkingDirectory=/opt/nelson_box
+EnvironmentFile=/etc/nelson_box.env
+ExecStart=/opt/nelson_box/venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 18888 --no-access-log --log-level warning
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/nelson_box/server/data
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

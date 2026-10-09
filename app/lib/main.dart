@@ -1,7 +1,12 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'hub.dart';
+import 'p2p.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,9 +40,12 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const _share = MethodChannel('nelsonbox/share');
   final _input = TextEditingController();
+  late final _tabs = TabController(length: 2, vsync: this);
+  late final P2P p2p = P2P(widget.hub, _share);
+  String? _targetId; // 文件发送目标设备
 
   Hub get hub => widget.hub;
 
@@ -50,12 +58,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _toast(hub.autoCopy ? '已复制来自【${item.sender}】的内容' : '收到来自【${item.sender}】的内容');
     };
     hub.onError = _toast;
+    p2p.onIncoming = (t) => _toast('正在接收来自【${t.peerName}】的文件…');
+    p2p.onSaved = (t, f) => _toast(
+          '已保存到 下载/NelsonBox：${f.name}',
+          action: SnackBarAction(label: '打开', onPressed: () => _open(f)),
+        );
+    p2p.onFailed = (t) {
+      if (t.error != '已取消') _toast('${t.dir == TransferDir.send ? '发送' : '接收'}失败：${t.error}');
+    };
 
     // 从“分享”菜单或文字选择菜单进入
     _share.setMethodCallHandler((call) async {
-      if (call.method == 'sharedText') _sendShared(call.arguments as String?);
+      switch (call.method) {
+        case 'sharedText':
+          _sendShared(call.arguments as String?);
+        case 'sharedFiles':
+          _sendSharedFiles((call.arguments as List?)?.cast<String>());
+      }
     });
     _share.invokeMethod<String>('takeSharedText').then(_sendShared);
+    _share.invokeListMethod<String>('takeSharedFiles').then(_sendSharedFiles);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!hub.configured) _openSettings();
@@ -66,6 +88,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _input.dispose();
+    _tabs.dispose();
+    p2p.dispose();
     super.dispose();
   }
 
@@ -78,6 +102,124 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (text == null || text.isEmpty) return;
     final err = hub.send(text);
     _toast(err ?? '已发送到所有设备');
+  }
+
+  /// 当前选中的发送目标：手动选过的优先；只有一台其他设备时默认选它
+  Device? get _target {
+    final others = hub.otherDevices;
+    for (final d in others) {
+      if (d.id == _targetId) return d;
+    }
+    return others.length == 1 ? others.first : null;
+  }
+
+  /// 刚启动时等 WebSocket 连上、拿到设备列表（最多等 8 秒）
+  Future<void> _waitOnline() async {
+    for (var i = 0; i < 40 && (hub.status != HubStatus.online || hub.devices.isEmpty); i++) {
+      if (hub.status == HubStatus.notConfigured || hub.status == HubStatus.unauthorized) return;
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+  }
+
+  /// 分享进来的文件（原生层已复制到缓存目录）：选目标设备后直传，结束后删除缓存副本
+  Future<void> _sendSharedFiles(List<String>? paths) async {
+    if (paths == null || paths.isEmpty) return;
+    Future<void> discard() async {
+      for (final p in paths) {
+        try {
+          final f = File(p);
+          await f.delete();
+          await f.parent.delete();
+        } catch (_) {}
+      }
+    }
+
+    if (mounted) _tabs.animateTo(1);
+    await _waitOnline();
+    final others = hub.otherDevices;
+    if (others.isEmpty) {
+      _toast(hub.status == HubStatus.online ? '没有其他在线设备，无法发送文件' : '未连接服务器，无法发送文件');
+      await discard();
+      return;
+    }
+    final target = others.length == 1 ? others.first : await _chooseDevice(others);
+    if (target == null) {
+      await discard();
+      return;
+    }
+    final files = [for (final p in paths) LocalFile(p, File(p).uri.pathSegments.last)];
+    final err = await p2p.sendFiles(target, files, deleteAfter: true);
+    if (err != null) _toast(err);
+  }
+
+  Future<Device?> _chooseDevice(List<Device> devices) async {
+    if (!mounted) return null;
+    return showModalBottomSheet<Device>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const ListTile(title: Text('发送到哪台设备？')),
+          for (final d in devices)
+            ListTile(
+              leading: Icon(_deviceIcon(d.type)),
+              title: Text(d.name),
+              onTap: () => Navigator.pop(ctx, d),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _pickAndSend() async {
+    final target = _target;
+    if (target == null) {
+      _toast('请先选择接收设备');
+      return;
+    }
+    final List<PlatformFile> picked;
+    try {
+      picked = await FilePicker.pickFiles();
+    } catch (_) {
+      _toast('无法打开文件选择器');
+      return;
+    }
+    if (picked.isEmpty) return;
+    final files = <LocalFile>[];
+    for (final f in picked) {
+      final path = f.path;
+      if (path == null) {
+        _toast('${f.name} 无法读取');
+        continue;
+      }
+      files.add(LocalFile(path, f.name));
+    }
+    if (files.isEmpty) return;
+    // file_picker 会把文件复制到缓存目录，传完删掉副本
+    final err = await p2p.sendFiles(target, files, deleteAfter: true);
+    if (err != null) _toast(err);
+  }
+
+  Future<void> _open(SavedFile f) async {
+    final err = await p2p.open(f);
+    if (err != null) _toast(err);
+  }
+
+  Future<void> _openSaved(Transfer t) async {
+    if (t.saved.length == 1) return _open(t.saved.first);
+    final f = await showModalBottomSheet<SavedFile>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(shrinkWrap: true, children: [
+          for (final f in t.saved)
+            ListTile(
+              leading: Icon(_fileIcon(f.name)),
+              title: Text(f.name),
+              onTap: () => Navigator.pop(ctx, f),
+            ),
+        ]),
+      ),
+    );
+    if (f != null) await _open(f);
   }
 
   Future<void> _sendPhoneClipboard() async {
@@ -104,11 +246,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _toast('已复制');
   }
 
-  void _toast(String msg) {
+  void _toast(String msg, {SnackBarAction? action}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
+      ..showSnackBar(SnackBar(
+        content: Text(msg),
+        action: action,
+        duration: Duration(seconds: action == null ? 2 : 5),
+      ));
   }
 
   Future<void> _openSettings() async {
@@ -118,7 +264,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: hub,
+      listenable: Listenable.merge([hub, p2p]),
       builder: (context, _) => Scaffold(
         appBar: AppBar(
           title: const Text('NelsonBox'),
@@ -126,58 +272,196 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _StatusChip(hub: hub),
             IconButton(icon: const Icon(Icons.settings_outlined), onPressed: _openSettings),
           ],
-        ),
-        body: RefreshIndicator(
-          onRefresh: () async => hub.connect(),
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-            children: [
-              if (hub.status == HubStatus.unauthorized || hub.status == HubStatus.notConfigured)
-                _Banner(
-                  text: hub.status == HubStatus.unauthorized ? '令牌错误，请在设置里修改' : '请先在设置里填写服务器和令牌',
-                  onTap: _openSettings,
-                ),
-              FilledButton.icon(
-                onPressed: _sendPhoneClipboard,
-                icon: const Icon(Icons.upload),
-                label: const Text('发送手机剪贴板'),
-                style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _input,
-                minLines: 1,
-                maxLines: 5,
-                decoration: InputDecoration(
-                  hintText: '或在这里输入内容',
-                  border: const OutlineInputBorder(),
-                  suffixIcon: IconButton(icon: const Icon(Icons.send), onPressed: _sendInput),
-                ),
-              ),
-              const SizedBox(height: 20),
-              Text('剪贴板记录 · 点击复制', style: Theme.of(context).textTheme.labelLarge),
-              const SizedBox(height: 4),
-              if (hub.history.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 24),
-                  child: Center(child: Text('暂无记录')),
-                ),
-              for (final item in hub.history)
-                Card(
-                  margin: const EdgeInsets.symmetric(vertical: 4),
-                  child: ListTile(
-                    title: Text(item.text, maxLines: 4, overflow: TextOverflow.ellipsis),
-                    subtitle: Text('${item.sender} · ${_formatTime(item.updatedAt)}'),
-                    trailing: const Icon(Icons.copy, size: 18),
-                    onTap: () => _copy(item),
-                  ),
-                ),
+          bottom: TabBar(
+            controller: _tabs,
+            tabs: [
+              const Tab(text: '剪贴板'),
+              Tab(text: switch (p2p.transfers.where((t) => t.active).length) {
+                0 => '文件',
+                final n => '文件 ($n)',
+              }),
             ],
           ),
         ),
+        body: TabBarView(controller: _tabs, children: [_clipboardTab(), _filesTab()]),
       ),
     );
   }
+
+  Widget _clipboardTab() {
+    return RefreshIndicator(
+      onRefresh: () async => hub.connect(),
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        children: [
+          ?_configBanner(),
+          FilledButton.icon(
+            onPressed: _sendPhoneClipboard,
+            icon: const Icon(Icons.upload),
+            label: const Text('发送手机剪贴板'),
+            style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _input,
+            minLines: 1,
+            maxLines: 5,
+            decoration: InputDecoration(
+              hintText: '或在这里输入内容',
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(icon: const Icon(Icons.send), onPressed: _sendInput),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Text('剪贴板记录 · 点击复制', style: Theme.of(context).textTheme.labelLarge),
+          const SizedBox(height: 4),
+          if (hub.history.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: Text('暂无记录')),
+            ),
+          for (final item in hub.history)
+            Card(
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              child: ListTile(
+                title: Text(item.text, maxLines: 4, overflow: TextOverflow.ellipsis),
+                subtitle: Text('${item.sender} · ${_formatTime(item.updatedAt)}'),
+                trailing: const Icon(Icons.copy, size: 18),
+                onTap: () => _copy(item),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget? _configBanner() {
+    if (hub.status != HubStatus.unauthorized && hub.status != HubStatus.notConfigured) return null;
+    return _Banner(
+      text: hub.status == HubStatus.unauthorized ? '令牌错误，请在设置里修改' : '请先在设置里填写服务器和令牌',
+      onTap: _openSettings,
+    );
+  }
+
+  Widget _filesTab() {
+    final others = hub.otherDevices;
+    final target = _target;
+    final finished = p2p.transfers.any((t) => !t.active);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      children: [
+        ?_configBanner(),
+        Text('发送到', style: Theme.of(context).textTheme.labelLarge),
+        const SizedBox(height: 4),
+        if (others.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              hub.status == HubStatus.online ? '没有其他在线设备' : '未连接服务器',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          )
+        else
+          Wrap(spacing: 8, runSpacing: 4, children: [
+            for (final d in others)
+              ChoiceChip(
+                avatar: Icon(_deviceIcon(d.type), size: 18),
+                label: Text(d.name),
+                selected: target?.id == d.id,
+                onSelected: (_) => setState(() => _targetId = d.id),
+              ),
+          ]),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: target == null ? null : _pickAndSend,
+          icon: const Icon(Icons.upload_file),
+          label: Text(target == null ? '选择文件发送' : '选择文件发送到 ${target.name}'),
+          style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '设备之间直连传输，不经过服务器；传输时请保持 App 在前台。收到的文件保存在 下载/NelsonBox',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 16),
+        Row(children: [
+          Expanded(child: Text('传输记录', style: Theme.of(context).textTheme.labelLarge)),
+          if (finished) TextButton(onPressed: p2p.clearFinished, child: const Text('清除已结束')),
+        ]),
+        if (p2p.transfers.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 24),
+            child: Center(child: Text('暂无传输')),
+          ),
+        for (final t in p2p.transfers) _transferCard(t),
+      ],
+    );
+  }
+
+  Widget _transferCard(Transfer t) {
+    final theme = Theme.of(context);
+    final send = t.dir == TransferDir.send;
+    final names = t.files.length == 1 ? t.files.first.name : '${t.files.first.name} 等 ${t.files.length} 个文件';
+    final details = [
+      '${send ? '发送给' : '来自'} ${t.peerName}',
+      formatBytes(t.total),
+      ?t.connType,
+    ].join(' · ');
+    final progress = t.status == TransferStatus.transferring
+        ? '${formatBytes(t.bytes)} / ${formatBytes(t.total)} · ${formatBytes(t.speed.bytesPerSecond.round())}/s'
+        : null;
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+        child: Row(children: [
+          Icon(send ? Icons.arrow_upward : Icons.arrow_downward,
+              color: t.status == TransferStatus.failed ? theme.colorScheme.error : theme.colorScheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${send ? '发送' : '接收'} · $names', maxLines: 2, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 2),
+              Text(details, style: theme.textTheme.bodySmall),
+              Text(
+                [t.statusText, ?progress].join(' · '),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: t.status == TransferStatus.failed ? theme.colorScheme.error : null,
+                ),
+              ),
+              if (t.active) ...[
+                const SizedBox(height: 6),
+                LinearProgressIndicator(value: t.status == TransferStatus.transferring ? t.fraction : null),
+              ],
+            ]),
+          ),
+          if (t.active)
+            IconButton(tooltip: '取消', icon: const Icon(Icons.close), onPressed: () => p2p.cancel(t))
+          else if (!send && t.saved.isNotEmpty)
+            TextButton(onPressed: () => _openSaved(t), child: const Text('打开')),
+        ]),
+      ),
+    );
+  }
+}
+
+IconData _deviceIcon(String type) => switch (type) {
+      'mac' || 'windows' || 'linux' => Icons.computer,
+      'android' => Icons.phone_android,
+      _ => Icons.language,
+    };
+
+IconData _fileIcon(String name) {
+  final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+  return switch (ext) {
+    'jpg' || 'jpeg' || 'png' || 'gif' || 'webp' || 'heic' || 'bmp' => Icons.image_outlined,
+    'mp4' || 'mov' || 'mkv' || 'avi' || 'webm' => Icons.movie_outlined,
+    'mp3' || 'wav' || 'm4a' || 'flac' || 'aac' || 'ogg' => Icons.audiotrack_outlined,
+    'pdf' => Icons.picture_as_pdf_outlined,
+    'zip' || 'rar' || '7z' || 'tar' || 'gz' => Icons.folder_zip_outlined,
+    'apk' => Icons.android,
+    _ => Icons.insert_drive_file_outlined,
+  };
 }
 
 String _formatTime(double ts) {
@@ -220,11 +504,7 @@ class _StatusChip extends StatelessWidget {
           const ListTile(title: Text('在线设备')),
           for (final d in hub.devices)
             ListTile(
-              leading: Icon(switch (d.type) {
-                'mac' || 'windows' || 'linux' => Icons.computer,
-                'android' => Icons.phone_android,
-                _ => Icons.language,
-              }),
+              leading: Icon(_deviceIcon(d.type)),
               title: Text(d.name),
               subtitle: Text(d.id == hub.deviceId ? '本机' : d.type),
             ),

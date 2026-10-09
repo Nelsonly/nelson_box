@@ -1,0 +1,31 @@
+# NelsonBox：直连失败时实时转发 WebRTC 加密数据，不存储任何内容
+listening-port=3478
+listening-ip=198.44.84.133
+relay-ip=198.44.84.133
+min-port=49160
+max-port=49260
+fingerprint
+use-auth-secret
+static-auth-secret=<与 NELSON_BOX_TURN_SECRET 相同的随机字符串>
+realm=nelsonbox
+no-tls
+no-dtls
+no-cli
+no-tcp-relay
+no-multicast-peers
+user-quota=8
+total-quota=40
+stale-nonce=600
+# 禁止转发到内网 / 本机地址，防止被当成跳板
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+syslog
+simple-log

@@ -25,3 +25,5 @@ dist/
 
 # Mac App 编译产物（含访问令牌）
 mac/build/
+mac/.build/
+mac/Sources/Generated/

@@ -13,14 +13,11 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<!-- 只在菜单栏显示，不占 Dock -->
-	<key>LSUIElement</key>
-	<true/>
 	<!-- 服务器目前是 HTTP，需要允许非加密连接；上了 HTTPS 后可以删掉 -->
 	<key>NSAppTransportSecurity</key>
 	<dict>

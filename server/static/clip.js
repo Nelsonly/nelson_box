@@ -10,10 +10,12 @@ const storage = {
 };
 
 let token = storage.get(TOKEN_KEY);
-let deviceId = storage.get(DEVICE_KEY);
+// 每个标签页一个设备 ID：同一浏览器开两个页面也能互传，不会互相挤下线
+let deviceId = null;
+try { deviceId = sessionStorage.getItem(DEVICE_KEY); } catch {}
 if (!deviceId) {
   deviceId = "web_" + Math.random().toString(36).slice(2, 10);
-  storage.set(DEVICE_KEY, deviceId);
+  try { sessionStorage.setItem(DEVICE_KEY, deviceId); } catch {}
 }
 const deviceName = /iPhone|iPad|Android/i.test(navigator.userAgent) ? "手机浏览器" : "网页端";
 
@@ -43,8 +45,15 @@ function connect() {
     } else if (msg.type === "devices:update") {
       devices = msg.devices;
       renderDevices();
+      renderTargets();
     } else if (msg.type === "clipboard:error") {
       toast(msg.error);
+    } else if (msg.type === "rtc:config") {
+      P2P.setIceServers(msg.ice_servers);
+    } else if (msg.type === "rtc:signal") {
+      P2P.handleSignal(msg.from, msg.from_name, msg.data);
+    } else if (msg.type === "rtc:error") {
+      P2P.handleError(msg);
     }
   };
   ws.onclose = (e) => {
@@ -181,6 +190,147 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
+// ---------- 文件（P2P 直传）----------
+function formatSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function renderTargets() {
+  const select = $("target");
+  const prev = select.value;
+  const others = devices.filter((d) => d.id !== deviceId);
+  select.replaceChildren(
+    ...others.map((d) => {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = `${d.name}（${d.type}）`;
+      return opt;
+    })
+  );
+  if (!others.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "没有其他在线设备";
+    select.append(opt);
+  }
+  if (others.some((d) => d.id === prev)) select.value = prev;
+}
+
+function sendFilesTo(fileList) {
+  const target = devices.find((d) => d.id === $("target").value && d.id !== deviceId);
+  if (!target) {
+    toast("没有可发送的在线设备");
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    toast("未连接到服务器");
+    return;
+  }
+  if (!P2P.sendFiles(target.id, target.name, fileList)) toast("没有可发送的文件（空文件会被跳过）");
+}
+
+const STATUS_TEXT = {
+  waiting: "等待对方响应…",
+  connecting: "正在建立直连…",
+  transferring: "传输中",
+  finishing: "等待对方确认…",
+  done: "完成",
+};
+
+function renderTransfers() {
+  const list = $("transfers");
+  const items = [...P2P.transfers.values()].reverse();
+  list.replaceChildren();
+  if (!items.length) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "暂无记录";
+    list.append(li);
+    return;
+  }
+  for (const t of items) {
+    const li = document.createElement("li");
+    const body = document.createElement("div");
+    body.className = "item-body";
+    const name = document.createElement("div");
+    name.className = "file-name";
+    const names = t.files.map((f) => f.name);
+    name.textContent = `${t.dir === "send" ? "↑ 发给" : "↓ 来自"}【${t.peerName}】 ${names[0] || ""}${names.length > 1 ? ` 等 ${names.length} 个` : ""}`;
+    const meta = document.createElement("div");
+    meta.className = "item-meta";
+    const secs = Math.max(0.001, ((t.finishedAt || Date.now()) - t.startedAt) / 1000);
+    const parts = [`${formatSize(t.done)} / ${formatSize(t.total)}`];
+    if (t.status === "transferring") parts.push(`${formatSize(t.done / secs)}/s`);
+    if (t.conn) parts.push(t.conn);
+    const status = document.createElement("span");
+    status.textContent = t.status === "failed" ? `失败：${t.error}` : STATUS_TEXT[t.status] || t.status;
+    status.className = `status-${t.status}`;
+    meta.append(parts.join(" · ") + " · ", status);
+    body.append(name, meta);
+    li.append(body);
+
+    const active = !["done", "failed"].includes(t.status);
+    if (active) {
+      const cancel = document.createElement("button");
+      cancel.className = "icon-btn";
+      cancel.textContent = "取消";
+      cancel.onclick = () => P2P.cancel(t.id);
+      li.append(cancel);
+    } else if (t.dir === "recv" && t.saved.length) {
+      const save = document.createElement("button");
+      save.className = "copy";
+      save.textContent = "再次保存";
+      save.onclick = () => t.saved.forEach((f) => saveBlob(f.name, f.blob));
+      li.append(save);
+    }
+    if (active && t.total) {
+      const bar = document.createElement("progress");
+      bar.max = 1;
+      bar.value = t.done / t.total;
+      li.append(bar);
+    }
+    list.append(li);
+  }
+}
+
+function saveBlob(name, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+P2P.configure({
+  signal: (to, data) => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "rtc:signal", to, data }));
+  },
+  update: (t) => {
+    renderTransfers();
+    if (t.status === "failed" && t.error) toast(`传输失败：${t.error}`);
+    if (t.status === "done") toast(t.dir === "send" ? `已发送给【${t.peerName}】` : `已收到【${t.peerName}】的文件`);
+  },
+  received: (t, name, blob) => {
+    showTab("files");
+    saveBlob(name, blob);
+  },
+});
+
+function showTab(name) {
+  for (const btn of document.querySelectorAll(".tab")) {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  }
+  $("tab-clip").hidden = name !== "clip";
+  $("tab-files").hidden = name !== "files";
+  storage.set("nelson_tab", name);
+}
+
 // ---------- 登录 ----------
 function showLogin(error = "") {
   $("app").hidden = true;
@@ -221,7 +371,31 @@ $("input").onkeydown = (e) => {
 };
 $("clear").onclick = clearHistory;
 $("logout").onclick = () => logout();
-$("status").onclick = () => $("devices").scrollIntoView({ behavior: "smooth" });
+$("status").onclick = () => {
+  showTab("clip");
+  $("devices").scrollIntoView({ behavior: "smooth" });
+};
+for (const btn of document.querySelectorAll(".tab")) {
+  btn.onclick = () => showTab(btn.dataset.tab);
+}
+$("file-input").onchange = (e) => {
+  sendFilesTo(e.target.files);
+  e.target.value = "";
+};
+const dz = $("dropzone");
+dz.ondragover = (e) => {
+  e.preventDefault();
+  dz.classList.add("over");
+};
+dz.ondragleave = () => dz.classList.remove("over");
+dz.ondrop = (e) => {
+  e.preventDefault();
+  dz.classList.remove("over");
+  sendFilesTo(e.dataTransfer.files);
+};
+showTab(storage.get("nelson_tab") || "clip");
+renderTargets();
+renderTransfers();
 
 if (token) connect();
 else showLogin();
