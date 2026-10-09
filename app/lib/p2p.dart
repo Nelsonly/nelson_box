@@ -210,7 +210,7 @@ class P2P extends ChangeNotifier {
       s.tmpDir = await Directory('${cache ?? Directory.systemTemp.path}/p2p_recv/$id').create(recursive: true);
       s.sink = _DiskSink(this, s);
       s.receiver = FileReceiver(s.sink!, metas, onProgress: (b) => _progress(s, b));
-      if (!s.t.active) return _cleanup(s);
+      if (!s.t.active) return await _cleanup(s);
 
       final pc = await _createPc(s);
       pc.onDataChannel = (dc) => _setupChannel(s, dc);

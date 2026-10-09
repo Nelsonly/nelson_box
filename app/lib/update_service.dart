@@ -159,7 +159,7 @@ class UpdateService {
       onProgress(received, total, 0);
       if (total > 0 && received != total) throw const HttpException('下载未完成');
       if (await finalFile.exists()) await finalFile.delete();
-      return partial.rename(finalFile.path);
+      return await partial.rename(finalFile.path);
     } finally {
       client.close();
     }
