@@ -1,4 +1,4 @@
-name: Release Android APK
+name: Release Windows
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag, for example v1.1.0+2'
+        description: 'Release tag, for example v1.2.0+4'
         required: true
         type: string
       prerelease:
@@ -20,15 +20,16 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-android-${{ github.ref }}
+  group: release-windows-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: app
+        shell: bash
 
     steps:
       - name: Check out repository
@@ -38,7 +39,6 @@ jobs:
 
       - name: Resolve version from tag
         id: version
-        shell: bash
         run: |
           TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
@@ -56,12 +56,6 @@ jobs:
           echo "build_name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
           echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -71,73 +65,60 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Analyze and test
-        run: |
-          flutter analyze
-          flutter test
-
-      - name: Verify signing secrets
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
-        run: |
-          [ -n "$KEYSTORE_BASE64" ] || { echo 'Missing GitHub secret: ANDROID_KEYSTORE_BASE64' >&2; exit 1; }
-          [ -n "$KEY_ALIAS" ] || { echo 'Missing GitHub secret: ANDROID_KEY_ALIAS' >&2; exit 1; }
-          [ -n "$KEY_PASSWORD" ] || { echo 'Missing GitHub secret: ANDROID_KEY_PASSWORD' >&2; exit 1; }
-          [ -n "$STORE_PASSWORD" ] || { echo 'Missing GitHub secret: ANDROID_STORE_PASSWORD' >&2; exit 1; }
-
-      - name: Restore release keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
-        run: |
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/release.jks
-          cat > android/key.properties <<EOF
-          storeFile=release.jks
-          storePassword=$STORE_PASSWORD
-          keyAlias=$KEY_ALIAS
-          keyPassword=$KEY_PASSWORD
-          EOF
-
-      - name: Build signed APK
+      - name: Build Windows release
         env:
           NB_SERVER: ${{ secrets.NB_SERVER }}
           NB_TOKEN: ${{ secrets.NB_TOKEN }}
         run: |
-          flutter build apk --release \
+          flutter build windows --release \
             --build-name='${{ steps.version.outputs.build_name }}' \
             --build-number='${{ steps.version.outputs.build_number }}' \
             --dart-define=NB_SERVER="$NB_SERVER" \
             --dart-define=NB_TOKEN="$NB_TOKEN"
-          cp build/app/outputs/flutter-apk/app-release.apk \
-            "../NelsonBox-Android-${{ steps.version.outputs.tag }}.apk"
+
+      # 把 VC++ 运行库放进程序目录，没装过运行库的电脑也能直接打开
+      - name: Bundle VC++ runtime
+        shell: pwsh
+        run: |
+          $out = "build\windows\x64\runner\Release"
+          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            Copy-Item "$env:WINDIR\System32\$dll" $out -ErrorAction Stop
+          }
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Package zip
+        id: package
+        shell: pwsh
+        run: |
+          $name = "NelsonBox-Windows-${{ steps.version.outputs.tag }}.zip"
+          $dir = "NelsonBox"
+          Copy-Item -Recurse "build\windows\x64\runner\Release" $dir
+          Compress-Archive -Path $dir -DestinationPath "..\$name"
+          "name=$name" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NelsonBox-Android-${{ steps.version.outputs.tag }}
-          path: NelsonBox-Android-${{ steps.version.outputs.tag }}.apk
+          name: NelsonBox-Windows-${{ steps.version.outputs.tag }}
+          path: ${{ steps.package.outputs.name }}
           if-no-files-found: error
 
-      - name: Create GitHub Release and upload APK
+      # Android 和 Windows 两个流程同时跑，谁先到谁创建 Release，另一个只上传文件
+      - name: Create GitHub Release and upload zip
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          FILE: ${{ steps.package.outputs.name }}
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         working-directory: ${{ github.workspace }}
         run: |
           FLAGS=(--title "NelsonBox $TAG" --generate-notes)
           if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
-          # 和 Windows 流程同时跑：谁先到谁创建 Release，另一个只上传文件
           for i in 1 2 3; do
             if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release upload "$TAG" "NelsonBox-Android-$TAG.apk" --clobber && exit 0
+              gh release upload "$TAG" "$FILE" --clobber && exit 0
             else
-              gh release create "$TAG" "NelsonBox-Android-$TAG.apk" "${FLAGS[@]}" && exit 0
+              gh release create "$TAG" "$FILE" "${FLAGS[@]}" && exit 0
             fi
             sleep 10
           done

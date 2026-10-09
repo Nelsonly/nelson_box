@@ -9,6 +9,7 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'ai_chat.dart';
+import 'platform.dart';
 
 const maxClipboardBytes = 64 * 1024; // 与服务端上限一致
 const maxHistory = 50;
@@ -61,7 +62,7 @@ class Hub extends ChangeNotifier {
   late SharedPreferences _prefs;
   String server = '';
   String token = '';
-  String deviceName = 'Android 手机';
+  String deviceName = AppPlatform.defaultDeviceName;
   String deviceId = '';
   bool autoCopy = true;
   bool autoCheckUpdates = true;
@@ -107,7 +108,7 @@ class Hub extends ChangeNotifier {
     deviceId = _prefs.getString('deviceId') ?? '';
     if (deviceId.isEmpty) {
       final r = Random.secure();
-      deviceId = 'android_${List.generate(8, (_) => r.nextInt(16).toRadixString(16)).join()}';
+      deviceId = '${AppPlatform.deviceType}_${List.generate(8, (_) => r.nextInt(16).toRadixString(16)).join()}';
       await _prefs.setString('deviceId', deviceId);
     }
     connect();
@@ -124,7 +125,7 @@ class Hub extends ChangeNotifier {
   }) async {
     this.server = server.trim().replaceAll(RegExp(r'/+$'), '');
     this.token = token.trim();
-    this.deviceName = deviceName.trim().isEmpty ? 'Android 手机' : deviceName.trim();
+    this.deviceName = deviceName.trim().isEmpty ? AppPlatform.defaultDeviceName : deviceName.trim();
     this.autoCopy = autoCopy;
     this.autoCheckUpdates = autoCheckUpdates;
     await _prefs.setString('server', this.server);
@@ -155,7 +156,7 @@ class Hub extends ChangeNotifier {
       queryParameters: {
         'device_id': deviceId,
         'name': deviceName,
-        'device_type': 'android',
+        'device_type': AppPlatform.deviceType,
         'token': token,
       },
     );
@@ -328,9 +329,15 @@ class Hub extends ChangeNotifier {
   }
 
   /// 发消息（手机端只用只读问答模式）。返回 null 表示已发出，否则返回错误信息
+  /// [edit] / [passcode] 只在桌面端生效（Android 固定只读问答）
   String? aiSend(String text,
-      {required String engine, required String project, ModelChoice choice = const ModelChoice()}) {
+      {required String engine,
+      required String project,
+      ModelChoice choice = const ModelChoice(),
+      bool edit = false,
+      String passcode = ''}) {
     if (text.trim().isEmpty) return '内容为空';
+    if (AppPlatform.allowsAiEdit && edit && passcode.isEmpty) return '可修改模式需要输入编辑口令';
     if (ai.busy) return '上一条回复还没结束';
     final cur = ai.current;
     final req = AiChat.newReq();
@@ -341,6 +348,9 @@ class Hub extends ChangeNotifier {
       text: text,
       req: req,
       choice: choice,
+      allowEdit: AppPlatform.allowsAiEdit,
+      edit: edit,
+      passcode: passcode,
     ));
     if (!ok) return '未连接服务器';
     ai.pendingReq = req;

@@ -8,6 +8,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'hub.dart';
 import 'p2p_protocol.dart';
+import 'platform.dart';
 
 enum TransferDir { send, receive }
 
@@ -16,7 +17,7 @@ enum TransferStatus { waiting, connecting, transferring, done, failed }
 /// 已保存到“下载/NelsonBox”的文件
 class SavedFile {
   final String name;
-  final String uri; // content:// URI，用于打开
+  final String uri; // Android: content:// URI；桌面：本地路径
   SavedFile(this.name, this.uri);
 }
 
@@ -88,7 +89,7 @@ class _Session {
 
 class P2P extends ChangeNotifier {
   final Hub hub;
-  final MethodChannel native;
+  final NativeBridge native;
 
   /// 本次运行内的传输记录（最新的在前）
   final List<Transfer> transfers = [];
@@ -200,14 +201,14 @@ class P2P extends ChangeNotifier {
 
     try {
       // Android 9 及以下要先拿到存储权限
-      final ok = await native.invokeMethod<bool>('ensureStoragePermission') ?? true;
+      final ok = await native.ensureStoragePermission();
       if (!ok) {
         hub.sendSignal(from, Signal.decline(id, '对方没有存储权限'));
         _fail(s, '没有存储权限，无法保存');
         return;
       }
-      final cache = await native.invokeMethod<String>('cacheDir');
-      s.tmpDir = await Directory('${cache ?? Directory.systemTemp.path}/p2p_recv/$id').create(recursive: true);
+      final cache = await native.cacheDir();
+      s.tmpDir = await Directory('$cache/p2p_recv/$id').create(recursive: true);
       s.sink = _DiskSink(this, s);
       s.receiver = FileReceiver(s.sink!, metas, onProgress: (b) => _progress(s, b));
       if (!s.t.active) return await _cleanup(s);
@@ -257,9 +258,8 @@ class P2P extends ChangeNotifier {
     s.saves = s.saves.then((_) async {
       try {
         if (s.saveError == null && s.t.status != TransferStatus.failed) {
-          final r = await native.invokeMapMethod<String, dynamic>(
-              'saveToDownloads', {'path': tmp.path, 'name': safeFileName(name)});
-          final saved = SavedFile(r?['name'] as String? ?? name, r?['uri'] as String? ?? '');
+          final r = await native.saveToDownloads(tmp.path, safeFileName(name));
+          final saved = SavedFile(r.name, r.uri);
           s.t.saved.add(saved);
           notifyListeners();
           onSaved?.call(s.t, saved);
@@ -282,14 +282,11 @@ class P2P extends ChangeNotifier {
   }
 
   /// 打开已保存的文件
-  Future<String?> open(SavedFile f) async {
-    try {
-      await native.invokeMethod('openFile', {'uri': f.uri, 'name': f.name});
-      return null;
-    } on PlatformException catch (e) {
-      return e.message ?? '无法打开';
-    }
-  }
+  Future<String?> open(SavedFile f) => native.openFile(f.uri, f.name);
+
+  /// 在文件夹中显示（仅桌面）
+  bool get canReveal => native.canReveal;
+  Future<String?> reveal(SavedFile f) => native.revealFile(f.uri);
 
   void clearFinished() {
     transfers.removeWhere((t) => !t.active);

@@ -12,6 +12,8 @@ class AppRelease {
   final String pageUrl;
   final String apkUrl;
   final int apkSize;
+  final String windowsUrl; // NelsonBox-Windows-<tag>.zip
+  final int windowsSize;
 
   const AppRelease({
     required this.tag,
@@ -20,19 +22,25 @@ class AppRelease {
     required this.pageUrl,
     required this.apkUrl,
     required this.apkSize,
+    this.windowsUrl = '',
+    this.windowsSize = 0,
   });
 
   factory AppRelease.fromJson(Map<String, dynamic> json) {
     String apkUrl = '';
     var apkSize = 0;
+    String windowsUrl = '';
+    var windowsSize = 0;
     for (final raw in json['assets'] as List? ?? const []) {
       if (raw is! Map) continue;
       final asset = Map<String, dynamic>.from(raw);
       final fileName = (asset['name'] as String? ?? '').toLowerCase();
-      if (fileName.endsWith('.apk')) {
+      if (apkUrl.isEmpty && fileName.endsWith('.apk')) {
         apkUrl = asset['browser_download_url'] as String? ?? '';
         apkSize = asset['size'] as int? ?? 0;
-        break;
+      } else if (windowsUrl.isEmpty && isWindowsAsset(fileName)) {
+        windowsUrl = asset['browser_download_url'] as String? ?? '';
+        windowsSize = asset['size'] as int? ?? 0;
       }
     }
     final tag = (json['tag_name'] as String? ?? '').trim();
@@ -43,10 +51,26 @@ class AppRelease {
       pageUrl: json['html_url'] as String? ?? UpdateService.releasesUrl,
       apkUrl: apkUrl,
       apkSize: apkSize,
+      windowsUrl: windowsUrl,
+      windowsSize: windowsSize,
     );
   }
 
-  String get formattedSize => apkSize <= 0 ? '未知大小' : '${(apkSize / 1024 / 1024).toStringAsFixed(1)} MB';
+  /// Windows 安装包：`NelsonBox-Windows-<tag>.zip`
+  static bool isWindowsAsset(String fileName) {
+    final n = fileName.toLowerCase();
+    return n.startsWith('nelsonbox-windows') && n.endsWith('.zip');
+  }
+
+  /// 当前平台能用的下载地址（Android: APK；Windows: zip）
+  String downloadUrl({required bool windows}) => windows ? windowsUrl : apkUrl;
+
+  String formattedSizeFor({required bool windows}) {
+    final size = windows ? windowsSize : apkSize;
+    return size <= 0 ? '未知大小' : '${(size / 1024 / 1024).toStringAsFixed(1)} MB';
+  }
+
+  String get formattedSize => formattedSizeFor(windows: false);
 }
 
 class UpdateService {
@@ -77,8 +101,9 @@ class UpdateService {
     return false;
   }
 
-  /// 优先取 latest；如果它的 APK 还在上传，则选最新的可下载 Release。
-  static Future<AppRelease?> latest() async {
+  /// 优先取 latest；如果它的安装包还在上传，则选最新的可下载 Release。
+  /// [windows] 为 true 时找 Windows zip，否则找 APK。
+  static Future<AppRelease?> latest({bool windows = false}) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 12);
     try {
       final request = await client.getUrl(Uri.parse(_apiUrl));
@@ -94,7 +119,7 @@ class UpdateService {
       for (final raw in decoded) {
         if (raw is! Map) continue;
         final release = AppRelease.fromJson(Map<String, dynamic>.from(raw));
-        if (release.apkUrl.isNotEmpty) return release;
+        if (release.downloadUrl(windows: windows).isNotEmpty) return release;
       }
       return null;
     } finally {
