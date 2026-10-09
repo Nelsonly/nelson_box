@@ -116,8 +116,9 @@ def verify_token(token: Optional[str] = Query(None)):
 @app.get("/", response_class=HTMLResponse)
 async def serve_index(request: Request):
     return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "auth_token": AUTH_TOKEN},
+        request=request,
+        name="index.html",
+        context={"auth_token": AUTH_TOKEN},
     )
 
 
@@ -246,6 +247,8 @@ async def websocket_endpoint(
     device_type: str = Query("web"),  # web | mac | windows | linux | android
     token: str = Query(""),
 ):
+    global current_clipboard
+
     if token != AUTH_TOKEN:
         await websocket.close(code=4001, reason="Unauthorized")
         return
@@ -266,7 +269,6 @@ async def websocket_endpoint(
             if action == "clipboard:send":
                 text = data.get("text", "")
                 if text:
-                    global current_clipboard
                     item = {
                         "id": str(uuid.uuid4())[:8],
                         "text": text,
